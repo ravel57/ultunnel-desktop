@@ -225,18 +225,15 @@ export default defineComponent({
 			try {
 				this.errorText = ''
 				if (this.isRunning) {
-					await invoke('singbox_stop')
+					await invoke('singbox_stop_platform')
 					this.isRunning = false
 					return
 				}
-
-				// при старте требуем выбранный профиль
 				if (!this.selectedProfile) {
 					this.errorText = 'Выберите профиль'
 					return
 				}
-
-				await invoke('singbox_start')
+				await invoke('singbox_start_platform')
 				this.isRunning = true
 			} catch (e: any) {
 				this.errorText = String(e)

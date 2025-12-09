@@ -1,7 +1,9 @@
 mod api;
 mod settings;
 
-use api::{fetch_raw_configs, normalize_configs, ProxyConfig};
+use api::fetch_raw_configs;
+use api::normalize_configs;
+use api::ProxyConfig;
 use settings::LocalSettings;
 use std::fs;
 use std::fs::OpenOptions;
@@ -82,99 +84,258 @@ fn get_profiles(state: State<'_, Arc<AppState>>) -> Vec<String> {
         .collect()
 }
 
-fn write_singbox_config(app: &AppHandle, cfg: &serde_json::Value) -> Result<PathBuf, String> {
+#[cfg(target_os = "macos")]
+fn run_as_admin(script: &str) -> Result<(), String> {
+    let out = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(format!(
+            r#"do shell script "{}" with administrator privileges"#,
+            script.replace('"', "\\\"")
+        ))
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).to_string())
+    }
+}
+
+fn write_singbox_config(
+    app: &tauri::AppHandle,
+    cfg: &serde_json::Value,
+) -> Result<std::path::PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-
+    let mut v = cfg.clone();
+    v = patch_config_for_macos(v);
     let path = dir.join("singbox.json");
-
-    let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| e.to_string())?;
-
     Ok(path)
 }
 
+// #[tauri::command]
+// async fn singbox_start(app: AppHandle, state: SharedState<'_>) -> Result<(), String> {
+//     if state.running.load(Ordering::Relaxed) {
+//         return Ok(());
+//     }
+//     let selected = state
+//         .settings
+//         .lock()
+//         .unwrap()
+//         .selected_config
+//         .clone()
+//         .ok_or("Не выбран конфиг")?;
+//     let cfg = {
+//         let list = state.configs.lock().unwrap();
+//         list.iter()
+//             .find(|c| c.name == selected)
+//             .cloned()
+//             .ok_or("Выбранный конфиг не найден (обновите список)")?
+//     };
+//     let cfg_path = write_singbox_config(&app, &cfg.config)?;
+//     let mut cmd = app.shell().sidecar("sing-box").map_err(|e| e.to_string())?;
+//     cmd = cmd.args(["run", "-c", cfg_path.to_string_lossy().as_ref()]);
+//     let (mut rx, child) = cmd.spawn().map_err(|e| e.to_string())?;
+//     *state.singbox.lock().unwrap() = Some(child);
+//     state.running.store(true, Ordering::Relaxed);
+//     let log_path = singbox_log_path(&app)?;
+//     let file = OpenOptions::new()
+//         .create(true)
+//         .append(true)
+//         .open(&log_path)
+//         .map_err(|e| e.to_string())?;
+//     let file = Arc::new(Mutex::new(file));
+//     let app_clone = app.clone();
+//     let file_clone = file.clone();
+//     let state_clone = state.inner().clone();
+//     tauri::async_runtime::spawn(async move {
+//         while let Some(event) = rx.recv().await {
+//             match event {
+//                 CommandEvent::Stdout(line) | CommandEvent::Stderr(line) => {
+//                     let text = String::from_utf8_lossy(&line).to_string();
+//                     if let Ok(mut f) = file_clone.lock() {
+//                         let _ = writeln!(f, "{}", text.trim_end());
+//                     }
+//                     let _ = app_clone.emit("singbox:log", text);
+//                 }
+//                 CommandEvent::Terminated(payload) => {
+//                     if let Ok(mut f) = file_clone.lock() {
+//                         let _ = writeln!(f, "TERMINATED: {:?}", payload);
+//                     }
+//                     let _ = app_clone.emit("singbox:exit", payload);
+//
+//                     // сбрасываем состояние
+//                     state_clone.running.store(false, Ordering::Relaxed);
+//                     let _ = state_clone.singbox.lock().unwrap().take();
+//                 }
+//                 _ => {}
+//             }
+//         }
+//     });
+//     Ok(())
+// }
+
 #[tauri::command]
-async fn singbox_start(app: AppHandle, state: SharedState<'_>) -> Result<(), String> {
-    if state.running.load(Ordering::Relaxed) {
-        return Ok(());
+async fn singbox_start_root(app: tauri::AppHandle, cfg_path: String) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err("macOS only".into());
     }
 
-    let selected = state
-        .settings
-        .lock()
-        .unwrap()
-        .selected_config
-        .clone()
-        .ok_or("Не выбран конфиг")?;
+    #[cfg(target_os = "macos")]
+    {
+        // бинарь лежит рядом с exe: Contents/MacOS/sing-box
+        let bin = std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .parent()
+            .ok_or("no exe parent".to_string())?
+            .join("sing-box");
 
-    let cfg = {
-        let list = state.configs.lock().unwrap();
-        list.iter()
-            .find(|c| c.name == selected)
-            .cloned()
-            .ok_or("Выбранный конфиг не найден (обновите список)")?
-    };
+        let root_dir = "/Library/Application Support/ultunnel";
+        let pid_file = "/Library/Application Support/ultunnel/singbox.pid";
+        let log_file = "/Library/Logs/ultunnel-singbox.log";
 
-    let cfg_path = write_singbox_config(&app, &cfg.config)?;
+        let sh = format!(
+            r#"/bin/sh -lc '
+set -e
+mkdir -p "{root_dir}"
 
-    let mut cmd = app.shell().sidecar("sing-box").map_err(|e| e.to_string())?;
-    cmd = cmd.args(["run", "-c", cfg_path.to_string_lossy().as_ref()]);
+# убить старый процесс
+if [ -f "{pid_file}" ]; then
+  old="$(cat "{pid_file}")"
+  if kill -0 "$old" 2>/dev/null; then
+    kill -TERM "$old" 2>/dev/null || true
+    sleep 0.7
+    kill -KILL "$old" 2>/dev/null || true
+  fi
+  rm -f "{pid_file}"
+fi
 
-    // ВАЖНО: spawn -> получаем rx и child
-    let (mut rx, child) = cmd.spawn().map_err(|e| e.to_string())?;
+: > "{log_file}"
 
-    // сохраняем child и выставляем running
-    *state.singbox.lock().unwrap() = Some(child);
-    state.running.store(true, Ordering::Relaxed);
+"{bin}" run -c "{cfg}" >> "{log_file}" 2>&1 < /dev/null &
+pid=$!
+echo "$pid" > "{pid_file}"
 
-    // лог-файл
-    let log_path = singbox_log_path(&app)?;
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| e.to_string())?;
-    let file = Arc::new(Mutex::new(file));
-    let app_clone = app.clone();
-    let file_clone = file.clone();
-    let state_clone = state.inner().clone(); // если SharedState<'_> = State<'_, Arc<AppState>>
-    tauri::async_runtime::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            match event {
-                CommandEvent::Stdout(line) | CommandEvent::Stderr(line) => {
-                    let text = String::from_utf8_lossy(&line).to_string();
-                    if let Ok(mut f) = file_clone.lock() {
-                        let _ = writeln!(f, "{}", text.trim_end());
-                    }
-                    let _ = app_clone.emit("singbox:log", text);
-                }
-                CommandEvent::Terminated(payload) => {
-                    if let Ok(mut f) = file_clone.lock() {
-                        let _ = writeln!(f, "TERMINATED: {:?}", payload);
-                    }
-                    let _ = app_clone.emit("singbox:exit", payload);
+sleep 0.5
+kill -0 "$pid" 2>/dev/null || {{ echo "sing-box died"; tail -n 120 "{log_file}"; exit 1; }}
+'"#,
+            root_dir = root_dir,
+            pid_file = pid_file,
+            log_file = log_file,
+            bin = bin.to_string_lossy().replace('"', r#"\""#),
+            cfg = cfg_path.replace('"', r#"\""#),
+        );
 
-                    // сбрасываем состояние
-                    state_clone.running.store(false, Ordering::Relaxed);
-                    let _ = state_clone.singbox.lock().unwrap().take();
-                }
-                _ => {}
-            }
-        }
-    });
+        run_as_admin(&sh)
+    }
+}
 
-    Ok(())
+// #[tauri::command]
+// fn singbox_stop(state: SharedState) -> Result<(), String> {
+//     if let Some(child) = state.singbox.lock().unwrap().take() {
+//         child.kill().map_err(|e| e.to_string())?;
+//     }
+//     state.running.store(false, Ordering::Relaxed);
+//     Ok(())
+// }
+
+#[tauri::command]
+async fn singbox_stop_root(_app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err("macOS only".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let pid_file = "/Library/Application Support/ultunnel/singbox.pid";
+        let sh = format!(
+            r#"/bin/sh -lc '
+set -e
+if [ -f "{pid}" ]; then
+  p="$(cat "{pid}")"
+  if kill -0 "$p" 2>/dev/null; then
+    kill -TERM "$p" 2>/dev/null || true
+    sleep 0.7
+    kill -KILL "$p" 2>/dev/null || true
+  fi
+  rm -f "{pid}"
+fi
+'"#,
+            pid = pid_file
+        );
+        run_as_admin(&sh)
+    }
 }
 
 #[tauri::command]
-fn singbox_stop(state: SharedState) -> Result<(), String> {
-    if let Some(child) = state.singbox.lock().unwrap().take() {
-        child.kill().map_err(|e| e.to_string())?;
+fn singbox_start_admin(app: AppHandle, cfg_path: String) -> Result<(), String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Err("Windows only".into());
     }
-    state.running.store(false, Ordering::Relaxed);
-    Ok(())
+    #[cfg(target_os = "windows")]
+    {
+        let exe_dir = std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .parent()
+            .ok_or("no exe dir".to_string())?
+            .to_path_buf();
+        let singbox = exe_dir.join("sing-box-x86_64-pc-windows-msvc.exe");
+        if !singbox.exists() {
+            return Err(format!("sing-box not found: {}", singbox.display()));
+        }
+        runas::Command::new(singbox)
+            .arg("run")
+            .arg("-c")
+            .arg(cfg_path)
+            .status()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn singbox_stop_admin(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Err("Windows only".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::fs;
+
+        let pid_path = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| e.to_string())?
+            .join("singbox.pid");
+
+        if !pid_path.exists() {
+            return Ok(());
+        }
+
+        let pid = fs::read_to_string(&pid_path).map_err(|e| e.to_string())?;
+        let pid = pid.trim();
+        if pid.is_empty() {
+            let _ = fs::remove_file(&pid_path);
+            return Ok(());
+        }
+        runas::Command::new("C:\\Windows\\System32\\taskkill.exe")
+            .arg("/PID")
+            .arg(pid)
+            .arg("/T")
+            .arg("/F")
+            .status()
+            .map_err(|e| e.to_string())?;
+
+        let _ = fs::remove_file(&pid_path);
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -229,7 +390,7 @@ pub fn run() {
                         }
                     }
                     "quit" => {
-                        if let Some(state) = app.try_state::<std::sync::Arc<AppState>>() {
+                        if let Some(state) = app.try_state::<Arc<AppState>>() {
                             kill_singbox(&state);
                         }
                         app.exit(0);
@@ -248,13 +409,13 @@ pub fn run() {
             let configs_path = configs_path_from_settings(&settings_path);
             let configs = load_configs_from_file(&configs_path);
 
-            let state = std::sync::Arc::new(AppState {
+            let state = Arc::new(AppState {
                 settings_path,
                 configs_path,
-                settings: std::sync::Mutex::new(settings),
-                configs: std::sync::Mutex::new(configs),
-                running: std::sync::atomic::AtomicBool::new(false),
-                singbox: std::sync::Mutex::new(None),
+                settings: Mutex::new(settings),
+                configs: Mutex::new(configs),
+                running: AtomicBool::new(false),
+                singbox: Mutex::new(None),
             });
             app.manage(state);
 
@@ -274,8 +435,12 @@ pub fn run() {
             get_state,
             get_profiles,
             load_configs,
-            singbox_start,
-            singbox_stop,
+            // singbox_start,
+            // singbox_stop,
+            singbox_start_root,
+            singbox_stop_root,
+            singbox_start_platform,
+            singbox_stop_platform,
             open_logs,
         ])
         .run(tauri::generate_context!())
@@ -321,7 +486,7 @@ fn app_log_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
 #[tauri::command]
 fn open_logs(app: AppHandle) -> Result<(), String> {
     let path = app_log_path(&app)?;
-    std::fs::OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
@@ -332,9 +497,101 @@ fn open_logs(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn singbox_log_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+fn singbox_log_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let logs_dir = dir.join("logs");
-    std::fs::create_dir_all(&logs_dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&logs_dir).map_err(|e| e.to_string())?;
     Ok(logs_dir.join("singbox.log"))
+}
+
+#[cfg(target_os = "macos")]
+fn singbox_bin_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = exe.parent().ok_or("no parent dir".to_string())?;
+    let p = dir.join("sing-box");
+    if p.exists() {
+        return Ok(p);
+    }
+    let res = app.path().resource_dir().map_err(|e| e.to_string())?;
+    let p2 = res.join("sing-box");
+    if p2.exists() {
+        return Ok(p2);
+    }
+    Err(format!("sing-box not found: {:?} / {:?}", p, p2))
+}
+
+fn patch_config_for_macos(mut cfg: serde_json::Value) -> serde_json::Value {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(inbounds) = cfg.get_mut("inbounds").and_then(|v| v.as_array_mut()) {
+            for ib in inbounds.iter_mut() {
+                if ib.get("type").and_then(|v| v.as_str()) == Some("tun") {
+                    if let Some(obj) = ib.as_object_mut() {
+                        obj.remove("interface_name");
+                    }
+                }
+            }
+        }
+    }
+    cfg
+}
+
+#[tauri::command]
+async fn singbox_start_platform(
+    app: tauri::AppHandle,
+    state: SharedState<'_>,
+) -> Result<(), String> {
+    // выбрать профиль
+    let selected = state
+        .settings
+        .lock()
+        .unwrap()
+        .selected_config
+        .clone()
+        .ok_or("Не выбран конфиг")?;
+
+    // найти конфиг
+    let cfg = {
+        let list = state.configs.lock().unwrap();
+        list.iter()
+            .find(|c| c.name == selected)
+            .cloned()
+            .ok_or("Выбранный конфиг не найден (обновите список)")?
+    };
+
+    // записать singbox.json (внутри write_singbox_config должен быть patch_config_for_macos)
+    let cfg_path = write_singbox_config(&app, &cfg.config)?;
+    let cfg_path_str = cfg_path.to_string_lossy().to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        return singbox_start_root(app, cfg_path_str).await;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return singbox_start_admin(app, cfg_path_str);
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        return singbox_start(app, state).await;
+    }
+}
+
+#[tauri::command]
+async fn singbox_stop_platform(
+    app: tauri::AppHandle,
+    state: SharedState<'_>,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        return singbox_stop_root(app).await;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return singbox_stop_admin(app);
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        return singbox_stop(app, state).await; // твой текущий stop для sidecar child
+    }
 }
