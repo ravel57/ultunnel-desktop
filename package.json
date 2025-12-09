@@ -1,24 +1,20 @@
 {
   "name": "ultunnel-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc --noEmit && vite build",
-    "preview": "vite preview",
-    "tauri": "tauri"
+    "build": "vite build",
+    "preview": "vite preview"
   },
   "dependencies": {
-    "vue": "^3.5.13",
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2"
+    "@tauri-apps/api": "^2.9.1",
+    "vue": "^3.5.24"
   },
   "devDependencies": {
-    "@vitejs/plugin-vue": "^5.2.1",
-    "typescript": "~5.6.2",
-    "vite": "^6.0.3",
-    "vue-tsc": "^2.1.10",
-    "@tauri-apps/cli": "^2"
+    "@tauri-apps/cli": "^2.9.5",
+    "@vitejs/plugin-vue": "^6.0.1",
+    "vite": "^7.2.4"
   }
 }

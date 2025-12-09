@@ -1,12 +1,19 @@
 {
+  "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "singbox",
-  "windows": {
-    "sidecar": [
-      {
-        "id": "singbox",
-        "path": "bin/sing-box-x86_64-pc-windows-msvc.exe"
-      }
-    ]
-  },
-  "permissions": ["shell:allow"]
+  "description": "Capability for Sing-box integration",
+  "windows": ["main"],
+  "permissions": [
+    "shell:default",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "bin/sing-box",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    }
+  ]
 }

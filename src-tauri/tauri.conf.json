@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "ru.ravel.ultunnel-desktop",
   "build": {
-    "beforeDevCommand": "yarn dev",
-    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "yarn build",
     "beforeBuildCommand": "yarn build",
+    "devUrl": null,
     "frontendDist": "../dist"
   },
   "app": {
@@ -30,9 +30,6 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ],
-    "externalBin": [
-      "bin/sing-box"
     ]
   }
 }

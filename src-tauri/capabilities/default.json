@@ -6,6 +6,17 @@
   "permissions": [
     "core:default",
     "opener:default",
-    "shell:default"
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "bin/sing-box",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    },
+    "shell:default",
+    "shell:allow-open"
   ]
 }
