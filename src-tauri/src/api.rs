@@ -80,7 +80,6 @@ pub fn normalize_configs(raw: Value) -> Result<Vec<ProxyConfig>, String> {
                         config: cfg_v.clone(),
                     });
                 }
-
             }
             continue;
         }
