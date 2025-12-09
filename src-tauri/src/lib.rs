@@ -99,16 +99,16 @@ fn run_as_admin(script: &str) -> Result<(), String> {
 }
 
 fn write_singbox_config(
-    app: &tauri::AppHandle,
+    app: &AppHandle,
     cfg: &serde_json::Value,
-) -> Result<std::path::PathBuf, String> {
+) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut v = cfg.clone();
     v = patch_config_for_macos(v);
     let path = dir.join("singbox.json");
     let json = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())?;
     Ok(path)
 }
 
@@ -121,7 +121,6 @@ async fn singbox_start_root(app: tauri::AppHandle, cfg_path: String) -> Result<(
 
     #[cfg(target_os = "macos")]
     {
-        // бинарь лежит рядом с exe: Contents/MacOS/sing-box
         let bin = std::env::current_exe()
             .map_err(|e| e.to_string())?
             .parent()
@@ -379,13 +378,13 @@ fn kill_singbox(state: &Arc<AppState>) {
     }
     state
         .running
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+        .store(false, Ordering::Relaxed);
 }
 
-fn app_log_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+fn app_log_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let logs_dir = dir.join("logs");
-    std::fs::create_dir_all(&logs_dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&logs_dir).map_err(|e| e.to_string())?;
     Ok(logs_dir.join("app.log"))
 }
 
