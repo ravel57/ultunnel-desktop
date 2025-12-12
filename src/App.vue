@@ -73,6 +73,82 @@
 					</div>
 				</div>
 
+				<!-- apps settings -->
+				<div class="card">
+					<div class="cardTitle">Маршрутизация</div>
+
+					<label class="row">
+						<input type="checkbox" v-model="split.enabled" @change="saveSplit"/>
+						<span>Раздельная маршрутизация</span>
+					</label>
+
+					<div class="grid2">
+						<div>
+							<div class="smallTitle">Outbound proxy</div>
+							<input class="input" v-model="split.proxyOutbound" @change="saveSplit" placeholder="proxy"/>
+						</div>
+						<div>
+							<div class="smallTitle">Outbound direct</div>
+							<input class="input" v-model="split.directOutbound" @change="saveSplit"
+								   placeholder="direct"/>
+						</div>
+					</div>
+
+					<div class="splitBlock">
+						<div class="smallTitle">Не пускать через прокси (apps → direct)</div>
+						<div class="row">
+							<input class="input" v-model="newBypassApp"
+								   placeholder="Windows: chrome.exe / macOS: Safari"/>
+							<button class="btn" @click="addTo('bypassApps','newBypassApp')">Добавить</button>
+						</div>
+						<div class="chips">
+						  <span class="chip" v-for="a in split.bypassApps" :key="a">
+							{{ a }} <button class="chipX" @click="removeFrom('bypassApps', a)">×</button>
+						  </span>
+						</div>
+					</div>
+
+					<div class="splitBlock">
+						<div class="smallTitle">Пускать через прокси (apps → proxy)</div>
+						<div class="row">
+							<input class="input" v-model="newProxyApp"
+								   placeholder="Windows: telegram.exe / macOS: Telegram"/>
+							<button class="btn" @click="addTo('proxyApps','newProxyApp')">Добавить</button>
+						</div>
+						<div class="chips">
+						  <span class="chip" v-for="a in split.proxyApps" :key="a">
+							{{ a }} <button class="chipX" @click="removeFrom('proxyApps', a)">×</button>
+						  </span>
+						</div>
+					</div>
+
+					<div class="splitBlock">
+						<div class="smallTitle">Не пускать через прокси (domains → direct)</div>
+						<div class="row">
+							<input class="input" v-model="newBypassDomain" placeholder="например: apple.com"/>
+							<button class="btn" @click="addTo('bypassDomains','newBypassDomain')">Добавить</button>
+						</div>
+						<div class="chips">
+						  <span class="chip" v-for="d in split.bypassDomains" :key="d">
+							{{ d }} <button class="chipX" @click="removeFrom('bypassDomains', d)">×</button>
+						  </span>
+						</div>
+					</div>
+
+					<div class="splitBlock">
+						<div class="smallTitle">Пускать через прокси (domains → proxy)</div>
+						<div class="row">
+							<input class="input" v-model="newProxyDomain" placeholder="например: google.com"/>
+							<button class="btn" @click="addTo('proxyDomains','newProxyDomain')">Добавить</button>
+						</div>
+						<div class="chips">
+						  <span class="chip" v-for="d in split.proxyDomains" :key="d">
+							{{ d }} <button class="chipX" @click="removeFrom('proxyDomains', d)">×</button>
+						  </span>
+						</div>
+					</div>
+				</div>
+
 				<!-- App section -->
 				<div class="card">
 					<div class="card-title">Приложение</div>
@@ -159,6 +235,31 @@
 </template>
 
 <script lang="ts">
+type SplitListKey = "bypassApps" | "proxyApps" | "bypassDomains" | "proxyDomains";
+type InputKey = "newBypassApp" | "newProxyApp" | "newBypassDomain" | "newProxyDomain";
+
+type SplitRoutingSettings = {
+	enabled: boolean
+	bypassApps: string[]
+	proxyApps: string[]
+	bypassDomains: string[]
+	proxyDomains: string[]
+	proxyOutbound: string
+	directOutbound: string
+}
+
+function defaultSplit(): SplitRoutingSettings {
+	return {
+		enabled: false,
+		bypassApps: [],
+		proxyApps: [],
+		bypassDomains: [],
+		proxyDomains: [],
+		proxyOutbound: "proxy",
+		directOutbound: "direct",
+	}
+}
+
 import {defineComponent} from 'vue'
 import {invoke} from '@tauri-apps/api/core'
 // import { open } from '@tauri-apps/plugin-shell' // если нет — убери openLogs() или используй opener plugin
@@ -187,11 +288,18 @@ export default defineComponent({
 
 			coreVersion: '—',
 			coreDataSize: '0 B',
+
+			split: defaultSplit(),
+			newBypassApp: "" as string,
+			newProxyApp: "" as string,
+			newBypassDomain: "" as string,
+			newProxyDomain: "" as string,
 		}
 	},
 
 	async created() {
 		await this.bootstrap()
+		await this.loadSplit();
 	},
 
 	methods: {
@@ -295,6 +403,36 @@ export default defineComponent({
 			} catch (e: any) {
 				this.errorText = String(e)
 			}
+		},
+		async loadSplit(): Promise<void> {
+			this.split = (await invoke<SplitRoutingSettings>("get_split_routing")) ?? defaultSplit();
+		},
+
+		async saveSplit(): Promise<void> {
+			await invoke("set_split_routing", {split: this.split});
+		},
+
+		addTo(listName: SplitListKey, valueField: InputKey): void {
+			const v = (this[valueField] || "").trim();
+			if (!v) {
+				return;
+			}
+			if (!this.split[listName].includes(v)) {
+				this.split[listName].push(v);
+			}
+			this[valueField] = "";
+			void this.saveSplit();
+		},
+
+		removeFrom(listName: SplitListKey, item: string): void {
+			this.split[listName] = this.split[listName].filter((x) => x !== item);
+			void this.saveSplit();
+		},
+
+		async saveSettings() {
+			await invoke("set_access_key", { key: this.accessKey })
+			await invoke("set_split_routing", { split: this.split })
+			alert("Настройки сохранены")
 		},
 
 		checkUpdates() {
@@ -566,4 +704,84 @@ export default defineComponent({
 .nav-txt {
 	font-size: 12px;
 }
+
+.card {
+	background: #1f1f1f;
+	border-radius: 16px;
+	padding: 16px;
+	margin: 12px 0;
+}
+
+.cardTitle {
+	font-size: 18px;
+	font-weight: 700;
+	margin-bottom: 12px;
+}
+
+.smallTitle {
+	opacity: .8;
+	font-size: 12px;
+	margin: 10px 0 6px;
+}
+
+.row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+
+.grid2 {
+	display: grid;
+	grid-template-columns:1fr 1fr;
+	gap: 12px;
+}
+
+.input {
+	flex: 1;
+	background: #2a2a2a;
+	border: 1px solid #3a3a3a;
+	color: #fff;
+	border-radius: 10px;
+	padding: 10px 12px;
+}
+
+.btn {
+	background: #3b82f6;
+	color: #fff;
+	border: none;
+	border-radius: 10px;
+	padding: 10px 12px;
+	cursor: pointer;
+}
+
+.splitBlock {
+	margin-top: 12px;
+}
+
+.chips {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-top: 10px;
+}
+
+.chip {
+	background: #2a2a2a;
+	border: 1px solid #3a3a3a;
+	border-radius: 999px;
+	padding: 6px 10px;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
+.chipX {
+	background: transparent;
+	border: none;
+	color: #fff;
+	cursor: pointer;
+	font-size: 16px;
+	line-height: 1;
+}
+
 </style>
