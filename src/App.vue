@@ -97,9 +97,11 @@
 					<div class="splitBlock">
 						<div class="smallTitle">Не пускать через прокси (apps → direct)</div>
 						<div class="row">
-							<input class="input" v-model="newBypassApp"
-								   placeholder="Windows: chrome.exe / macOS: Safari"/>
-							<button class="btn" @click="addTo('bypassApps','newBypassApp')">Добавить</button>
+							<!--<input class="input" v-model="newBypassApp"-->
+							<!--	   placeholder="Windows: chrome.exe / macOS: Safari"/>-->
+							<!--<button class="btn" @click="addTo('bypassApps','newBypassApp')">Добавить</button>-->
+							<button class="btn btn-ghost" @click="openAppsPicker('bypassApps')">Выбрать из запущенных
+							</button>
 						</div>
 						<div class="chips">
 						  <span class="chip" v-for="a in split.bypassApps" :key="a">
@@ -111,9 +113,11 @@
 					<div class="splitBlock">
 						<div class="smallTitle">Пускать через прокси (apps → proxy)</div>
 						<div class="row">
-							<input class="input" v-model="newProxyApp"
-								   placeholder="Windows: telegram.exe / macOS: Telegram"/>
-							<button class="btn" @click="addTo('proxyApps','newProxyApp')">Добавить</button>
+							<!--<input class="input" v-model="newProxyApp"-->
+							<!--	   placeholder="Windows: telegram.exe / macOS: Telegram"/>-->
+							<!--<button class="btn" @click="addTo('proxyApps','newProxyApp')">Добавить</button>-->
+							<button class="btn btn-ghost" @click="openAppsPicker('proxyApps')">Выбрать из запущенных
+							</button>
 						</div>
 						<div class="chips">
 						  <span class="chip" v-for="a in split.proxyApps" :key="a">
@@ -150,53 +154,47 @@
 				</div>
 
 				<!-- App section -->
-				<div class="card">
-					<div class="card-title">Приложение</div>
-
-					<div class="setting-row">
-						<div class="setting-label">Отображать скорость в уведомлении</div>
-						<select class="select" v-model="showSpeed">
-							<option value="on">Включено</option>
-							<option value="off">Выключено</option>
-						</select>
-					</div>
-
-					<div class="setting-row">
-						<div class="setting-label">Автоматическая проверка обновлений</div>
-						<select class="select" v-model="autoUpdate">
-							<option value="on">Включено</option>
-							<option value="off">Выключено</option>
-						</select>
-					</div>
-
-					<div class="actions grid3">
-						<button class="btn btn-ghost" @click="checkUpdates">Проверить обновление</button>
-						<button class="btn btn-ghost" @click="openPrivacy">Политика конфиденциальности</button>
-						<button class="btn btn-ghost" @click="openAbout">О приложении</button>
-					</div>
-				</div>
-
+				<!--<div class="card">-->
+				<!--	<div class="card-title">Приложение</div>-->
+				<!--	<div class="setting-row">-->
+				<!--		<div class="setting-label">Отображать скорость в уведомлении</div>-->
+				<!--		<select class="select" v-model="showSpeed">-->
+				<!--			<option value="on">Включено</option>-->
+				<!--			<option value="off">Выключено</option>-->
+				<!--		</select>-->
+				<!--	</div>-->
+				<!--	<div class="setting-row">-->
+				<!--		<div class="setting-label">Автоматическая проверка обновлений</div>-->
+				<!--		<select class="select" v-model="autoUpdate">-->
+				<!--			<option value="on">Включено</option>-->
+				<!--			<option value="off">Выключено</option>-->
+				<!--		</select>-->
+				<!--	</div>-->
+				<!--	<div class="actions grid3">-->
+				<!--		<button class="btn btn-ghost" @click="checkUpdates">Проверить обновление</button>-->
+				<!--		<button class="btn btn-ghost" @click="openPrivacy">Политика конфиденциальности</button>-->
+				<!--		<button class="btn btn-ghost" @click="openAbout">О приложении</button>-->
+				<!--	</div>-->
+				<!--</div>-->
 				<!-- Core section -->
-				<div class="card">
-					<div class="card-title">Ядро</div>
-
-					<div class="kv">
-						<div class="k">Версия</div>
-						<div class="v">{{ coreVersion }}</div>
-					</div>
-					<div class="kv">
-						<div class="k">Размер данных</div>
-						<div class="v">{{ coreDataSize }}</div>
-					</div>
-
-					<div class="setting-row">
-						<div class="setting-label">Ограничение памяти</div>
-						<select class="select" v-model="memLimit">
-							<option value="on">Включено</option>
-							<option value="off">Выключено</option>
-						</select>
-					</div>
-				</div>
+				<!--<div class="card">-->
+				<!--<div class="card-title">Ядро</div>-->
+				<!--	<div class="kv">-->
+				<!--		<div class="k">Версия</div>-->
+				<!--		<div class="v">{{ coreVersion }}</div>-->
+				<!--	</div>-->
+				<!--	<div class="kv">-->
+				<!--		<div class="k">Размер данных</div>-->
+				<!--		<div class="v">{{ coreDataSize }}</div>-->
+				<!--	</div>-->
+				<!--	<div class="setting-row">-->
+				<!--		<div class="setting-label">Ограничение памяти</div>-->
+				<!--		<select class="select" v-model="memLimit">-->
+				<!--			<option value="on">Включено</option>-->
+				<!--			<option value="off">Выключено</option>-->
+				<!--		</select>-->
+				<!--	</div>-->
+				<!--</div>-->
 			</div>
 		</div>
 
@@ -232,6 +230,50 @@
 			</button>
 		</div>
 	</div>
+
+	<!-- Apps Picker Modal -->
+	<div v-if="appsModalOpen" class="modalOverlay" @click.self="closeAppsPicker">
+		<div class="modal">
+			<div class="modalHead">
+				<div class="modalTitle">Запущенные приложения</div>
+				<button class="btn btn-ghost" @click="closeAppsPicker">✕</button>
+			</div>
+
+			<div class="row">
+				<input class="input" v-model="appsSearch" placeholder="Поиск: имя / путь / заголовок окна…"/>
+				<button class="btn" @click="refreshRunningApps" :disabled="appsLoading">
+					{{ appsLoading ? 'Обновление…' : 'Обновить' }}
+				</button>
+			</div>
+
+			<div class="muted" v-if="appsLoading">Загрузка…</div>
+
+			<div class="appsList" v-else>
+				<button
+					v-for="a in filteredRunningApps"
+					:key="a.pid + ':' + (a.path || a.name)"
+					class="appRow"
+					@click="addRunningApp(a)"
+				>
+					<div class="appMain">
+						<div class="appName">{{ a.name }}</div>
+						<div class="appTitle" v-if="a.title">{{ a.title }}</div>
+					</div>
+					<div class="appPath">{{ a.path || '—' }}</div>
+				</button>
+
+				<div class="muted" v-if="!filteredRunningApps.length">
+					Ничего не найдено
+				</div>
+			</div>
+
+			<div class="modalHint muted">
+				При выборе добавляется <b>путь</b> (process_path). Если путь недоступен — добавится имя процесса
+				(process_name).
+			</div>
+		</div>
+	</div>
+
 </template>
 
 <script lang="ts">
@@ -246,6 +288,13 @@ type SplitRoutingSettings = {
 	proxyDomains: string[]
 	proxyOutbound: string
 	directOutbound: string
+}
+
+type RunningApp = {
+	pid: number
+	name: string
+	path?: string | null
+	title?: string | null
 }
 
 function defaultSplit(): SplitRoutingSettings {
@@ -266,36 +315,40 @@ import {invoke} from '@tauri-apps/api/core'
 
 export default defineComponent({
 	name: 'App',
-	data() {
-		return {
-			activeTab: 'control' as 'control' | 'settings',
+	data: () => ({
+		activeTab: 'control' as 'control' | 'settings',
 
-			isRunning: false,
+		isRunning: false,
 
-			profiles: [] as string[],
-			selectedProfile: '' as string,
+		profiles: [] as string[],
+		selectedProfile: '' as string,
 
-			accessKey: '' as string,
+		accessKey: '' as string,
 
-			loadingProfiles: false,
-			loadingConfigs: false,
-			errorText: '' as string,
+		loadingProfiles: false,
+		loadingConfigs: false,
+		errorText: '' as string,
 
-			// settings UI (пока просто UI, можно потом сохранять)
-			showSpeed: 'on',
-			autoUpdate: 'on',
-			memLimit: 'on',
+		// settings UI (пока просто UI, можно потом сохранять)
+		showSpeed: 'on',
+		autoUpdate: 'on',
+		memLimit: 'on',
 
-			coreVersion: '—',
-			coreDataSize: '0 B',
+		coreVersion: '—',
+		coreDataSize: '0 B',
 
-			split: defaultSplit(),
-			newBypassApp: "" as string,
-			newProxyApp: "" as string,
-			newBypassDomain: "" as string,
-			newProxyDomain: "" as string,
-		}
-	},
+		split: defaultSplit(),
+		newBypassApp: "" as string,
+		newProxyApp: "" as string,
+		newBypassDomain: "" as string,
+		newProxyDomain: "" as string,
+
+		runningApps: [] as RunningApp[],
+		appsLoading: false,
+		appsModalOpen: false,
+		appsModalTarget: null as null | SplitListKey, // куда добавляем: bypassApps или proxyApps
+		appsSearch: "" as string,
+	}),
 
 	async created() {
 		await this.bootstrap()
@@ -409,7 +462,13 @@ export default defineComponent({
 		},
 
 		async saveSplit(): Promise<void> {
-			await invoke("set_split_routing", {split: this.split});
+			await invoke("set_split_routing", { split: this.split })
+			// применить сразу
+			if (this.isRunning) {
+				await invoke("singbox_stop_platform")
+				await invoke("singbox_start_platform")
+				this.isRunning = true
+			}
 		},
 
 		addTo(listName: SplitListKey, valueField: InputKey): void {
@@ -430,8 +489,8 @@ export default defineComponent({
 		},
 
 		async saveSettings() {
-			await invoke("set_access_key", { key: this.accessKey })
-			await invoke("set_split_routing", { split: this.split })
+			await invoke("set_access_key", {key: this.accessKey})
+			await invoke("set_split_routing", {split: this.split})
 			alert("Настройки сохранены")
 		},
 
@@ -448,7 +507,62 @@ export default defineComponent({
 		openAbout() {
 			// UI-заглушка
 			this.errorText = 'О приложении: пока не реализовано'
-		}
+		},
+
+		async openAppsPicker(target: SplitListKey) {
+			this.appsModalTarget = target
+			this.appsModalOpen = true
+			this.appsSearch = ""
+
+			// грузим при открытии
+			if (!this.runningApps.length) {
+				await this.refreshRunningApps()
+			}
+		},
+
+		async refreshRunningApps() {
+			try {
+				this.appsLoading = true
+				this.runningApps = await invoke<RunningApp[]>("list_running_apps")
+			} finally {
+				this.appsLoading = false
+			}
+		},
+
+		closeAppsPicker() {
+			this.appsModalOpen = false
+			this.appsModalTarget = null
+		},
+
+		addRunningApp(app: RunningApp) {
+			if (!this.appsModalTarget) return
+
+			// предпочтительно добавляем PATH (самое надёжное для sing-box: process_path)
+			let value =
+				(app.path && String(app.path).trim().length ? String(app.path).trim() : "") ||
+				(app.name || "").trim()
+
+			if (!value) return
+
+			if (!this.split[this.appsModalTarget].includes(value)) {
+				this.split[this.appsModalTarget].push(value)
+				void this.saveSplit()
+			}
+		},
+	},
+
+	computed: {
+		filteredRunningApps(): RunningApp[] {
+			const q = (this.appsSearch || "").trim().toLowerCase()
+			if (!q) return this.runningApps
+
+			return this.runningApps.filter(a => {
+				const n = (a.name || "").toLowerCase()
+				const p = (a.path || "").toLowerCase()
+				const t = (a.title || "").toLowerCase()
+				return n.includes(q) || p.includes(q) || t.includes(q)
+			})
+		},
 	}
 })
 </script>
@@ -480,6 +594,8 @@ export default defineComponent({
 
 /* Content */
 .content {
+	width: 50vw;
+	min-width: 300px;
 	flex: 1;
 	overflow: auto;
 	padding: 10px 14px 90px;
@@ -782,6 +898,91 @@ export default defineComponent({
 	cursor: pointer;
 	font-size: 16px;
 	line-height: 1;
+}
+
+.modalOverlay {
+	position: fixed;
+	inset: 0;
+	background: rgba(0, 0, 0, .45);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 16px;
+	z-index: 9999;
+}
+
+.modal {
+	width: min(900px, 100%);
+	max-height: min(80vh, 760px);
+	background: #14141a;
+	border: 1px solid rgba(255, 255, 255, .08);
+	border-radius: 14px;
+	overflow: hidden;
+	display: flex;
+	flex-direction: column;
+}
+
+.modalHead {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 12px 12px;
+	border-bottom: 1px solid rgba(255, 255, 255, .08);
+}
+
+.modalTitle {
+	font-weight: 700;
+}
+
+.appsList {
+	overflow: auto;
+	padding: 10px;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.appRow {
+	text-align: left;
+	border: 1px solid rgba(255, 255, 255, .08);
+	background: rgba(255, 255, 255, .03);
+	border-radius: 12px;
+	padding: 10px 12px;
+	cursor: pointer;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.appRow:hover {
+	background: rgba(255, 255, 255, .06);
+}
+
+.appMain {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.appName {
+	font-weight: 700;
+}
+
+.appTitle {
+	color: rgba(255, 255, 255, .65);
+	font-size: 12px;
+}
+
+.appPath {
+	color: rgba(255, 255, 255, .55);
+	font-size: 12px;
+	word-break: break-all;
+}
+
+.modalHint {
+	padding: 10px 12px;
+	border-top: 1px solid rgba(255, 255, 255, .08);
 }
 
 </style>
