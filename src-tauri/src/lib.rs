@@ -27,7 +27,7 @@ use tauri::WindowEvent;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::process::CommandChild;
 
-// struct SingBoxState(Mutex<Option<std::process::Child>>);
+static EXITING: AtomicBool = AtomicBool::new(false);
 
 pub struct AppState {
     pub settings_path: PathBuf,
@@ -341,7 +341,7 @@ async fn load_configs(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, St
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
@@ -367,9 +367,6 @@ pub fn run() {
                         }
                     }
                     "quit" => {
-                        if let Some(state) = app.try_state::<Arc<AppState>>() {
-                            kill_singbox(&state);
-                        }
                         app.exit(0);
                     }
                     _ => {}
@@ -423,8 +420,21 @@ pub fn run() {
             get_socks5_inbound,
             set_socks5_inbound,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running tauri application");
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if EXITING.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            api.prevent_exit();
+            let app = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                stop_singbox_before_exit(&app);
+                app.exit(0);
+            });
+        }
+    });
 }
 
 fn configs_path_from_settings(settings_path: &Path) -> PathBuf {
@@ -452,6 +462,32 @@ fn kill_singbox(state: &Arc<AppState>) {
         let _ = child.kill();
     }
     state.running.store(false, Ordering::Relaxed);
+}
+
+fn stop_singbox_before_exit(app: &tauri::AppHandle) {
+    // Всегда помечаем как "не запущено" в состоянии
+    if let Some(state) = app.try_state::<Arc<AppState>>() {
+        state.running.store(false, Ordering::Relaxed);
+    }
+    // macOS: у вас stop идет через osascript (потребует прав)
+    #[cfg(target_os = "macos")]
+    {
+        let _ = tauri::async_runtime::block_on(singbox_stop_root(app.clone()));
+        return;
+    }
+    // Windows: у вас stop идет через taskkill, запускаемый runas (может показать UAC)
+    #[cfg(target_os = "windows")]
+    {
+        let _ = singbox_stop_admin(app.clone());
+        return;
+    }
+    // Linux/прочие: sing-box у вас живет как CommandChild в state.singbox
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        if let Some(state) = app.try_state::<Arc<AppState>>() {
+            kill_singbox(&state);
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
