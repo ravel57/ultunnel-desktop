@@ -1012,7 +1012,7 @@ fn apply_socks5_inbound(cfg: &mut serde_json::Value, enabled: bool, proxy_outbou
             "type": "socks",
             "tag": "socks-in",
             "listen": "127.0.0.1",
-            "listen_port": 56130,
+            "listen_port": 5613,
             "sniff": true
         }));
     }
