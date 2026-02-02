@@ -94,21 +94,21 @@
 						</div>
 					</div>
 
-					<div class="splitBlock">
-						<div class="smallTitle">Не пускать через прокси (apps → direct)</div>
-						<div class="row">
-							<!--<input class="input" v-model="newBypassApp"-->
-							<!--	   placeholder="Windows: chrome.exe / macOS: Safari"/>-->
-							<!--<button class="btn" @click="addTo('bypassApps','newBypassApp')">Добавить</button>-->
-							<button class="btn btn-ghost" @click="openAppsPicker('bypassApps')">Выбрать из запущенных
-							</button>
-						</div>
-						<div class="chips">
-						  <span class="chip" v-for="a in split.bypassApps" :key="a">
-							{{ a }} <button class="chipX" @click="removeFrom('bypassApps', a)">×</button>
-						  </span>
-						</div>
-					</div>
+					<!--<div class="splitBlock">-->
+					<!--	<div class="smallTitle">Не пускать через прокси (apps → direct)</div>-->
+					<!--	<div class="row">-->
+					<!--		&lt;!&ndash;<input class="input" v-model="newBypassApp"&ndash;&gt;-->
+					<!--		&lt;!&ndash;	   placeholder="Windows: chrome.exe / macOS: Safari"/>&ndash;&gt;-->
+					<!--		&lt;!&ndash;<button class="btn" @click="addTo('bypassApps','newBypassApp')">Добавить</button>&ndash;&gt;-->
+					<!--		<button class="btn btn-ghost" @click="openAppsPicker('bypassApps')">Выбрать из запущенных-->
+					<!--		</button>-->
+					<!--	</div>-->
+					<!--	<div class="chips">-->
+					<!--	  <span class="chip" v-for="a in split.bypassApps" :key="a">-->
+					<!--		{{ a }} <button class="chipX" @click="removeFrom('bypassApps', a)">×</button>-->
+					<!--	  </span>-->
+					<!--	</div>-->
+					<!--</div>-->
 
 					<div class="splitBlock">
 						<div class="smallTitle">Пускать через прокси (apps → proxy)</div>
@@ -126,18 +126,18 @@
 						</div>
 					</div>
 
-					<div class="splitBlock">
-						<div class="smallTitle">Не пускать через прокси (domains → direct)</div>
-						<div class="row">
-							<input class="input" v-model="newBypassDomain" placeholder="например: apple.com"/>
-							<button class="btn" @click="addTo('bypassDomains','newBypassDomain')">Добавить</button>
-						</div>
-						<div class="chips">
-						  <span class="chip" v-for="d in split.bypassDomains" :key="d">
-							{{ d }} <button class="chipX" @click="removeFrom('bypassDomains', d)">×</button>
-						  </span>
-						</div>
-					</div>
+					<!--<div class="splitBlock">-->
+					<!--	<div class="smallTitle">Не пускать через прокси (domains → direct)</div>-->
+					<!--	<div class="row">-->
+					<!--		<input class="input" v-model="newBypassDomain" placeholder="например: apple.com"/>-->
+					<!--		<button class="btn" @click="addTo('bypassDomains','newBypassDomain')">Добавить</button>-->
+					<!--	</div>-->
+					<!--	<div class="chips">-->
+					<!--	  <span class="chip" v-for="d in split.bypassDomains" :key="d">-->
+					<!--		{{ d }} <button class="chipX" @click="removeFrom('bypassDomains', d)">×</button>-->
+					<!--	  </span>-->
+					<!--	</div>-->
+					<!--</div>-->
 
 					<div class="splitBlock">
 						<div class="smallTitle">Пускать через прокси (domains → proxy)</div>
@@ -154,11 +154,16 @@
 
 					<div class="splitBlock">
 						<label class="row">
-							<input type="checkbox" v-model="socks5Inbound" @change="saveSocks5Inbound"/>
+							<input
+								type="checkbox"
+								v-model="socks5Inbound"
+								:disabled="!split.enabled"
+								@change="saveSocks5Inbound"
+							/>
 							<span>Включить браузерный прокси</span>
 						</label>
-						<div class="muted" style="margin-top:6px">
-							Локальный SOCKS5 входящий прокси для приложений, которые умеют работать через SOCKS.
+						<div class="muted" v-if="!split.enabled" style="margin-top:6px">
+							Доступно только при включенной «Раздельной маршрутизации».
 						</div>
 					</div>
 				</div>
