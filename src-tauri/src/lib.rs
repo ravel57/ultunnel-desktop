@@ -79,13 +79,14 @@ fn set_selected_profile(state: State<'_, Arc<AppState>>, profile: String) -> Res
 
 #[tauri::command]
 fn get_state(state: SharedState) -> bool {
-	#[cfg(target_os = "windows")]
-	{
-		return is_singbox_running_windows();
-	}
-	#[cfg(not(target_os = "windows"))]{
-		state.running.load(Ordering::Relaxed)
-	}
+    #[cfg(target_os = "windows")]
+    {
+        return is_singbox_running_windows();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        state.running.load(Ordering::Relaxed)
+    }
 }
 
 #[tauri::command]
@@ -140,6 +141,11 @@ fn write_singbox_config(
     }
 
     apply_split_routing(&mut v, &settings.split_routing);
+    apply_socks5_inbound(
+        &mut v,
+        settings.socks5_inbound,
+        &settings.split_routing.proxy_outbound,
+    );
 
     let json = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
     fs::write(&path, json).map_err(|e| e.to_string())?;
@@ -414,6 +420,8 @@ pub fn run() {
             get_split_routing,
             set_split_routing,
             list_running_apps,
+            get_socks5_inbound,
+            set_socks5_inbound,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -448,34 +456,37 @@ fn kill_singbox(state: &Arc<AppState>) {
 
 #[cfg(target_os = "windows")]
 fn is_singbox_running_windows() -> bool {
-	use std::process::Command;
+    use std::process::Command;
 
-	let out = Command::new("tasklist")
-		.args(["/FI", "IMAGENAME eq sing-box.exe"])
-		.output();
+    let out = Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq sing-box.exe"])
+        .output();
 
-	match out {
-		Ok(o) if o.status.success() => {
-			let s = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
-			// tasklist выводит имя процесса, если он найден
-			s.contains("sing-box.exe")
-		}
-		_ => false,
-	}
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
+            // tasklist выводит имя процесса, если он найден
+            s.contains("sing-box.exe")
+        }
+        _ => false,
+    }
 }
 
 #[cfg(target_os = "windows")]
 fn wait_singbox_running_windows(timeout_ms: u64) -> bool {
-	use std::{thread::sleep, time::{Duration, Instant}};
+    use std::{
+        thread::sleep,
+        time::{Duration, Instant},
+    };
 
-	let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-	while Instant::now() < deadline {
-		if is_singbox_running_windows() {
-			return true;
-		}
-		sleep(Duration::from_millis(120));
-	}
-	false
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        if is_singbox_running_windows() {
+            return true;
+        }
+        sleep(Duration::from_millis(120));
+    }
+    false
 }
 
 fn app_log_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -600,29 +611,31 @@ async fn singbox_start_platform(app: AppHandle, state: SharedState<'_>) -> Resul
 }
 
 #[tauri::command]
-async fn singbox_stop_platform(app: tauri::AppHandle, state: SharedState<'_>) -> Result<(), String> {
-	#[cfg(target_os = "macos")]
-	{
-		let r = singbox_stop_root(app).await;
-		state.running.store(false, Ordering::Relaxed);
-		return r;
-	}
+async fn singbox_stop_platform(
+    app: tauri::AppHandle,
+    state: SharedState<'_>,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let r = singbox_stop_root(app).await;
+        state.running.store(false, Ordering::Relaxed);
+        return r;
+    }
 
-	#[cfg(target_os = "windows")]
-	{
-		let r = singbox_stop_admin(app);
-		state.running.store(false, Ordering::Relaxed);
-		return r;
-	}
+    #[cfg(target_os = "windows")]
+    {
+        let r = singbox_stop_admin(app);
+        state.running.store(false, Ordering::Relaxed);
+        return r;
+    }
 
-	#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-	{
-		let r = singbox_stop(app, state).await;
-		state.running.store(false, Ordering::Relaxed);
-		return r;
-	}
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let r = singbox_stop(app, state).await;
+        state.running.store(false, Ordering::Relaxed);
+        return r;
+    }
 }
-
 
 #[tauri::command]
 fn get_split_routing(state: SharedState) -> SplitRoutingSettings {
@@ -687,149 +700,188 @@ fn split_process_tokens(list: &[String]) -> (Vec<String>, Vec<String>) {
 }
 
 fn apply_split_routing(cfg: &mut serde_json::Value, split: &SplitRoutingSettings) {
-	if !split.enabled {
-		return;
-	}
+    if !split.enabled {
+        return;
+    }
 
-	use serde_json::{json, Map, Value};
+    use serde_json::{json, Map, Value};
 
-	let root = match cfg.as_object_mut() {
-		Some(v) => v,
-		None => return,
-	};
+    let root = match cfg.as_object_mut() {
+        Some(v) => v,
+        None => return,
+    };
 
-	// route object
-	if !root.contains_key("route") || !root.get("route").unwrap().is_object() {
-		root.insert("route".into(), Value::Object(Map::new()));
-	}
-	let route = root.get_mut("route").and_then(|v| v.as_object_mut()).unwrap();
+    // route object
+    if !root.contains_key("route") || !root.get("route").unwrap().is_object() {
+        root.insert("route".into(), Value::Object(Map::new()));
+    }
+    let route = root
+        .get_mut("route")
+        .and_then(|v| v.as_object_mut())
+        .unwrap();
 
-	// === КЛЮЧЕВОЕ: split = default DIRECT, а VPN только по правилам ===
-	route.insert("final".to_string(), Value::String(split.direct_outbound.clone()));
+    // === КЛЮЧЕВОЕ: split = default DIRECT, а VPN только по правилам ===
+    route.insert(
+        "final".to_string(),
+        Value::String(split.direct_outbound.clone()),
+    );
 
-	// process_* правила требуют find_process=true
-	let has_process_rules =
-		split.bypass_apps.iter().any(|s| !s.trim().is_empty())
-		|| split.proxy_apps.iter().any(|s| !s.trim().is_empty());
-	if has_process_rules {
-		route.entry("find_process".to_string()).or_insert(Value::Bool(true));
-	}
+    // process_* правила требуют find_process=true
+    let has_process_rules = split.bypass_apps.iter().any(|s| !s.trim().is_empty())
+        || split.proxy_apps.iter().any(|s| !s.trim().is_empty());
+    if has_process_rules {
+        route
+            .entry("find_process".to_string())
+            .or_insert(Value::Bool(true));
+    }
 
-	// rules array
-	if !route.contains_key("rules") || !route.get("rules").unwrap().is_array() {
-		route.insert("rules".into(), Value::Array(vec![]));
-	}
-	let rules = route.get_mut("rules").and_then(|v| v.as_array_mut()).unwrap();
+    // rules array
+    if !route.contains_key("rules") || !route.get("rules").unwrap().is_array() {
+        route.insert("rules".into(), Value::Array(vec![]));
+    }
+    let rules = route
+        .get_mut("rules")
+        .and_then(|v| v.as_array_mut())
+        .unwrap();
 
-	let is_action = |r: &Value, a: &str| -> bool {
-		r.as_object()
-			.and_then(|o| o.get("action"))
-			.and_then(|v| v.as_str()) == Some(a)
-	};
+    let is_action = |r: &Value, a: &str| -> bool {
+        r.as_object()
+            .and_then(|o| o.get("action"))
+            .and_then(|v| v.as_str())
+            == Some(a)
+    };
 
-	let inbound_is_tun = |r: &Value| -> bool {
-		let o = match r.as_object() { Some(x) => x, None => return false };
-		match o.get("inbound").and_then(|v| v.as_array()) {
-			Some(a) => a.len() == 1 && a[0].as_str() == Some("tun-in"),
-			None => false
-		}
-	};
+    let inbound_is_tun = |r: &Value| -> bool {
+        let o = match r.as_object() {
+            Some(x) => x,
+            None => return false,
+        };
+        match o.get("inbound").and_then(|v| v.as_array()) {
+            Some(a) => a.len() == 1 && a[0].as_str() == Some("tun-in"),
+            None => false,
+        }
+    };
 
-	// 0) Гарантируем sniff + hijack-dns (для доменных правил)
-	if !rules.iter().any(|r| is_action(r, "sniff")) {
-		rules.insert(0, json!({ "inbound": ["tun-in"], "action": "sniff" }));
-	}
-	if !rules.iter().any(|r| is_action(r, "hijack-dns")) {
-		let idx = rules.iter().position(|r| is_action(r, "sniff")).map(|i| i + 1).unwrap_or(0);
-		rules.insert(idx, json!({ "protocol": ["dns"], "action": "hijack-dns" }));
-	}
+    // 0) Гарантируем sniff + hijack-dns (для доменных правил)
+    if !rules.iter().any(|r| is_action(r, "sniff")) {
+        rules.insert(0, json!({ "inbound": ["tun-in"], "action": "sniff" }));
+    }
+    if !rules.iter().any(|r| is_action(r, "hijack-dns")) {
+        let idx = rules
+            .iter()
+            .position(|r| is_action(r, "sniff"))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        rules.insert(idx, json!({ "protocol": ["dns"], "action": "hijack-dns" }));
+    }
 
-	// 1) Удаляем безусловный catch-all tun-in -> proxy (он и делает “всё в VPN”)
-	rules.retain(|r| {
-		let o = match r.as_object() { Some(x) => x, None => return true };
+    // 1) Удаляем безусловный catch-all tun-in -> proxy (он и делает “всё в VPN”)
+    rules.retain(|r| {
+        let o = match r.as_object() {
+            Some(x) => x,
+            None => return true,
+        };
 
-		// не трогаем action-правила
-		if o.contains_key("action") {
-			return true;
-		}
+        // не трогаем action-правила
+        if o.contains_key("action") {
+            return true;
+        }
 
-		// удаляем только "чистый" catch-all:
-		// { inbound:["tun-in"], outbound:"proxy_outbound" } без доп условий
-		let outbound = o.get("outbound").and_then(|v| v.as_str());
-		if inbound_is_tun(r) && outbound == Some(split.proxy_outbound.as_str()) {
-			let has_any_condition =
-				o.contains_key("process_name")
-				|| o.contains_key("process_path")
-				|| o.contains_key("domain_suffix")
-				|| o.contains_key("ip_cidr")
-				|| o.contains_key("port")
-				|| o.contains_key("network")
-				|| o.contains_key("protocol");
-			return has_any_condition; // если есть условия — оставляем, иначе удаляем
-		}
+        // удаляем только "чистый" catch-all:
+        // { inbound:["tun-in"], outbound:"proxy_outbound" } без доп условий
+        let outbound = o.get("outbound").and_then(|v| v.as_str());
+        if inbound_is_tun(r) && outbound == Some(split.proxy_outbound.as_str()) {
+            let has_any_condition = o.contains_key("process_name")
+                || o.contains_key("process_path")
+                || o.contains_key("domain_suffix")
+                || o.contains_key("ip_cidr")
+                || o.contains_key("port")
+                || o.contains_key("network")
+                || o.contains_key("protocol");
+            return has_any_condition; // если есть условия — оставляем, иначе удаляем
+        }
 
-		true
-	});
+        true
+    });
 
-	// 2) Удаляем ранее сгенерированные split-правила (чтобы не копились и не конфликтовали)
-	rules.retain(|r| {
-		let o = match r.as_object() { Some(x) => x, None => return true };
-		if o.contains_key("action") { return true; }
+    // 2) Удаляем ранее сгенерированные split-правила (чтобы не копились и не конфликтовали)
+    rules.retain(|r| {
+        let o = match r.as_object() {
+            Some(x) => x,
+            None => return true,
+        };
+        if o.contains_key("action") {
+            return true;
+        }
 
-		if !inbound_is_tun(r) { return true; }
+        if !inbound_is_tun(r) {
+            return true;
+        }
 
-		let outbound = match o.get("outbound").and_then(|v| v.as_str()) {
-			Some(x) => x,
-			None => return true,
-		};
+        let outbound = match o.get("outbound").and_then(|v| v.as_str()) {
+            Some(x) => x,
+            None => return true,
+        };
 
-		if outbound != split.direct_outbound && outbound != split.proxy_outbound {
-			return true;
-		}
+        if outbound != split.direct_outbound && outbound != split.proxy_outbound {
+            return true;
+        }
 
-		let is_split = o.contains_key("process_name") || o.contains_key("process_path") || o.contains_key("domain_suffix");
-		!is_split // split-правила удаляем
-	});
+        let is_split = o.contains_key("process_name")
+            || o.contains_key("process_path")
+            || o.contains_key("domain_suffix");
+        !is_split // split-правила удаляем
+    });
 
-	// 3) Генерим актуальные выборочные правила
-	let mut new_rules: Vec<Value> = Vec::new();
+    // 3) Генерим актуальные выборочные правила
+    let mut new_rules: Vec<Value> = Vec::new();
 
-	// bypass (apps/domains -> direct)
-	let (bypass_names, bypass_paths) = split_process_tokens(&split.bypass_apps);
-	if !bypass_paths.is_empty() {
-		new_rules.push(json!({ "inbound":["tun-in"], "process_path": bypass_paths, "outbound": split.direct_outbound }));
-	}
-	if !bypass_names.is_empty() {
-		new_rules.push(json!({ "inbound":["tun-in"], "process_name": bypass_names, "outbound": split.direct_outbound }));
-	}
-	let bypass_domains: Vec<String> = split.bypass_domains.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-	if !bypass_domains.is_empty() {
-		new_rules.push(json!({ "inbound":["tun-in"], "domain_suffix": bypass_domains, "outbound": split.direct_outbound }));
-	}
+    // bypass (apps/domains -> direct)
+    let (bypass_names, bypass_paths) = split_process_tokens(&split.bypass_apps);
+    if !bypass_paths.is_empty() {
+        new_rules.push(json!({ "inbound":["tun-in"], "process_path": bypass_paths, "outbound": split.direct_outbound }));
+    }
+    if !bypass_names.is_empty() {
+        new_rules.push(json!({ "inbound":["tun-in"], "process_name": bypass_names, "outbound": split.direct_outbound }));
+    }
+    let bypass_domains: Vec<String> = split
+        .bypass_domains
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !bypass_domains.is_empty() {
+        new_rules.push(json!({ "inbound":["tun-in"], "domain_suffix": bypass_domains, "outbound": split.direct_outbound }));
+    }
 
-	// proxy (apps/domains -> proxy)
-	let (proxy_names, proxy_paths) = split_process_tokens(&split.proxy_apps);
-	if !proxy_paths.is_empty() {
-		new_rules.push(json!({ "inbound":["tun-in"], "process_path": proxy_paths, "outbound": split.proxy_outbound }));
-	}
-	if !proxy_names.is_empty() {
-		new_rules.push(json!({ "inbound":["tun-in"], "process_name": proxy_names, "outbound": split.proxy_outbound }));
-	}
-	let proxy_domains: Vec<String> = split.proxy_domains.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-	if !proxy_domains.is_empty() {
-		new_rules.push(json!({ "inbound":["tun-in"], "domain_suffix": proxy_domains, "outbound": split.proxy_outbound }));
-	}
+    // proxy (apps/domains -> proxy)
+    let (proxy_names, proxy_paths) = split_process_tokens(&split.proxy_apps);
+    if !proxy_paths.is_empty() {
+        new_rules.push(json!({ "inbound":["tun-in"], "process_path": proxy_paths, "outbound": split.proxy_outbound }));
+    }
+    if !proxy_names.is_empty() {
+        new_rules.push(json!({ "inbound":["tun-in"], "process_name": proxy_names, "outbound": split.proxy_outbound }));
+    }
+    let proxy_domains: Vec<String> = split
+        .proxy_domains
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !proxy_domains.is_empty() {
+        new_rules.push(json!({ "inbound":["tun-in"], "domain_suffix": proxy_domains, "outbound": split.proxy_outbound }));
+    }
 
-	// 4) Вставляем после sniff/hijack-dns
-	if !new_rules.is_empty() {
-		let mut insert_at = 0usize;
-		for (i, r) in rules.iter().enumerate() {
-			if is_action(r, "sniff") || is_action(r, "hijack-dns") {
-				insert_at = i + 1;
-			}
-		}
-		rules.splice(insert_at..insert_at, new_rules);
-	}
+    // 4) Вставляем после sniff/hijack-dns
+    if !new_rules.is_empty() {
+        let mut insert_at = 0usize;
+        for (i, r) in rules.iter().enumerate() {
+            if is_action(r, "sniff") || is_action(r, "hijack-dns") {
+                insert_at = i + 1;
+            }
+        }
+        rules.splice(insert_at..insert_at, new_rules);
+    }
 }
 
 #[tauri::command]
@@ -921,4 +973,124 @@ Get-Process |
     }
 
     Ok(res)
+}
+
+#[tauri::command]
+fn get_socks5_inbound(state: SharedState) -> bool {
+    state.settings.lock().unwrap().socks5_inbound
+}
+
+#[tauri::command]
+fn set_socks5_inbound(state: SharedState, enabled: bool) -> Result<(), String> {
+    let mut s = state.settings.lock().unwrap();
+    s.socks5_inbound = enabled;
+    s.save(&state.settings_path)
+}
+
+fn apply_socks5_inbound(cfg: &mut serde_json::Value, enabled: bool, proxy_outbound: &str) {
+    use serde_json::{json, Map, Value};
+
+    let root = match cfg.as_object_mut() {
+        Some(v) => v,
+        None => return,
+    };
+
+    // --- inbounds ---
+    if !root.contains_key("inbounds") || !root.get("inbounds").unwrap().is_array() {
+        root.insert("inbounds".into(), Value::Array(vec![]));
+    }
+    let inbounds = root
+        .get_mut("inbounds")
+        .and_then(|v| v.as_array_mut())
+        .unwrap();
+
+    // удалить старый socks-in (если был)
+    inbounds.retain(|ib| ib.get("tag").and_then(|v| v.as_str()) != Some("socks-in"));
+
+    if enabled {
+        inbounds.push(json!({
+            "type": "socks",
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "listen_port": 56130,
+            "sniff": true
+        }));
+    }
+
+    // --- route.rules ---
+    if !root.contains_key("route") || !root.get("route").unwrap().is_object() {
+        root.insert("route".into(), Value::Object(Map::new()));
+    }
+    let route = root
+        .get_mut("route")
+        .and_then(|v| v.as_object_mut())
+        .unwrap();
+
+    if !route.contains_key("rules") || !route.get("rules").unwrap().is_array() {
+        route.insert("rules".into(), Value::Array(vec![]));
+    }
+    let rules = route
+        .get_mut("rules")
+        .and_then(|v| v.as_array_mut())
+        .unwrap();
+
+    // удалить старое правило socks-in -> proxy
+    rules.retain(|r| {
+        let o = match r.as_object() {
+            Some(x) => x,
+            None => return true,
+        };
+
+        let inbound_is_socks = match o.get("inbound").and_then(|v| v.as_array()) {
+            Some(a) => a.iter().any(|x| x.as_str() == Some("socks-in")),
+            None => false,
+        };
+
+        // удаляем только простое правило "inbound socks-in -> outbound proxy"
+        if inbound_is_socks {
+            let outbound = o.get("outbound").and_then(|v| v.as_str());
+            let has_action = o.contains_key("action");
+            let has_other_conditions = o.contains_key("process_name")
+                || o.contains_key("process_path")
+                || o.contains_key("domain_suffix")
+                || o.contains_key("ip_cidr")
+                || o.contains_key("port")
+                || o.contains_key("network")
+                || o.contains_key("protocol");
+
+            if !has_action && !has_other_conditions && outbound.is_some() {
+                return false;
+            }
+        }
+
+        true
+    });
+
+    if enabled {
+        // вставить правило socks-in -> proxy как можно выше (после sniff/hijack-dns если они есть)
+        let mut insert_at = 0usize;
+        for (i, r) in rules.iter().enumerate() {
+            let action = r
+                .as_object()
+                .and_then(|o| o.get("action"))
+                .and_then(|a| a.as_str());
+            if action == Some("sniff") || action == Some("hijack-dns") {
+                insert_at = i + 1;
+            }
+        }
+
+        let out = if proxy_outbound.trim().is_empty() {
+            "proxy"
+        } else {
+            proxy_outbound
+        };
+
+        rules.insert(
+            insert_at,
+            json!({
+                "inbound": ["socks-in"],
+                "outbound": out
+            }),
+        );
+    }
 }

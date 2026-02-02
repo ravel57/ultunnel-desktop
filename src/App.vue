@@ -151,6 +151,16 @@
 						  </span>
 						</div>
 					</div>
+
+					<div class="splitBlock">
+						<label class="row">
+							<input type="checkbox" v-model="socks5Inbound" @change="saveSocks5Inbound"/>
+							<span>Включить браузерный прокси</span>
+						</label>
+						<div class="muted" style="margin-top:6px">
+							Локальный SOCKS5 входящий прокси для приложений, которые умеют работать через SOCKS.
+						</div>
+					</div>
 				</div>
 
 				<!-- App section -->
@@ -348,11 +358,14 @@ export default defineComponent({
 		appsModalOpen: false,
 		appsModalTarget: null as null | SplitListKey, // куда добавляем: bypassApps или proxyApps
 		appsSearch: "" as string,
+
+		socks5Inbound: false,
 	}),
 
 	async created() {
 		await this.bootstrap()
-		await this.loadSplit();
+		await this.loadSplit()
+		await this.loadSocks5Inbound()
 	},
 
 	methods: {
@@ -462,7 +475,7 @@ export default defineComponent({
 		},
 
 		async saveSplit(): Promise<void> {
-			await invoke("set_split_routing", { split: this.split })
+			await invoke("set_split_routing", {split: this.split})
 			// применить сразу
 			if (this.isRunning) {
 				await invoke("singbox_stop_platform")
@@ -549,6 +562,22 @@ export default defineComponent({
 				void this.saveSplit()
 			}
 		},
+
+		async loadSocks5Inbound(): Promise<void> {
+			this.socks5Inbound = await invoke<boolean>("get_socks5_inbound")
+		},
+
+		async saveSocks5Inbound(): Promise<void> {
+			await invoke("set_socks5_inbound", {enabled: this.socks5Inbound})
+
+			// применить сразу
+			if (this.isRunning) {
+				await invoke("singbox_stop_platform")
+				await invoke("singbox_start_platform")
+				this.isRunning = true
+			}
+		},
+
 	},
 
 	computed: {

@@ -57,6 +57,9 @@ pub struct LocalSettings {
     // новые настройки (важно: default, чтобы старый config.json не ломался)
     #[serde(default)]
     pub split_routing: SplitRoutingSettings,
+
+    #[serde(default)]
+    pub socks5_inbound: bool,
 }
 
 impl Default for LocalSettings {
@@ -65,6 +68,7 @@ impl Default for LocalSettings {
             access_key: String::new(),
             selected_config: None,
             split_routing: SplitRoutingSettings::default(),
+            socks5_inbound: false,
         }
     }
 }
