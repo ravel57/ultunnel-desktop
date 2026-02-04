@@ -5,7 +5,7 @@ final class SingBoxRunner {
 
     // Поменяйте, если sing-box лежит в другом месте.
     // Важно: у root-launchd может не быть PATH, поэтому только абсолютный путь.
-    private let singBoxPath = "/usr/local/bin/sing-box"
+    private let singBoxPath = "/Applications/ultunnel-desktop.app/Contents/MacOS/sing-box"
 
     func start(configPath: String) throws -> String {
         if let p = process, p.isRunning {
