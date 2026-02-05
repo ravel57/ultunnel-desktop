@@ -1,10 +1,14 @@
 import Foundation
 import OSLog
 
-let log = Logger(subsystem: "ru.ravel.ultunnel-macos.helper", category: "main")
-log.info("helper started")
+private let machServiceName = "ru.ravel.ultunnel-macos.helper"
+private let log = Logger(subsystem: machServiceName, category: "main")
 
-final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
+log.info("helper started pid=\(getpid())")
+
+// MARK: - SingBoxRunner
+
+final class SingBoxRunner {
     private let q = DispatchQueue(label: "ru.ravel.ultunnel.helper.singbox")
     private var process: Process?
     private var stdoutPipe: Pipe?
@@ -14,39 +18,30 @@ final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
     private let ringMax = 800
 
     func tailLogs(maxLines: Int) -> String {
-        return q.sync {
+        q.sync {
             let n = max(0, min(maxLines, ring.count))
             return ring.suffix(n).joined(separator: "\n")
         }
     }
 
-    func startSingBox(_ singBoxPath: String,
-                    configPath: String,
-                    argsJson: String,
-                    reply: @escaping (Int32, String) -> Void) {
-      if process != nil {
-          reply(1, "already running")
-          return
-    }
-
     func isRunning() -> (Bool, Int32) {
-        return q.sync {
+        q.sync {
             if let p = process, p.isRunning { return (true, p.processIdentifier) }
             return (false, 0)
         }
     }
 
     func stop() -> String {
-        return q.sync {
+        q.sync {
             guard let p = process else { return "not running" }
-            if p.isRunning {
-                p.terminate()
-            }
+            if p.isRunning { p.terminate() }
+
             process = nil
             stdoutPipe?.fileHandleForReading.readabilityHandler = nil
             stderrPipe?.fileHandleForReading.readabilityHandler = nil
             stdoutPipe = nil
             stderrPipe = nil
+
             return "stopped"
         }
     }
@@ -75,7 +70,6 @@ final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: singBoxPath)
 
-            // Базовые аргументы + то, что пришло из argsJson
             var args: [String] = ["run", "-c", configPath]
             args.append(contentsOf: extraArgs)
             p.arguments = args
@@ -121,7 +115,7 @@ final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
             try p.run()
             process = p
             appendLog(prefix: "PROC", text: "started pid=\(p.processIdentifier) exe=\(singBoxPath) args=\(args)")
-            return "started pid=\(p.processIdentifier))"
+            return "started pid=\(p.processIdentifier)"
         }
     }
 
@@ -132,9 +126,8 @@ final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map { "[\(prefix)] \($0)" }
 
-            for l in lines {
-                self.ring.append(l)
-            }
+            for l in lines { self.ring.append(l) }
+
             if self.ring.count > self.ringMax {
                 self.ring.removeFirst(self.ring.count - self.ringMax)
             }
@@ -148,7 +141,6 @@ private func decodeArgsJson(_ s: String) -> [String] {
     let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.isEmpty { return [] }
 
-    // Ожидаем JSON-массив строк: ["--foo","bar"]
     guard let data = trimmed.data(using: .utf8) else { return [] }
 
     do {
@@ -165,15 +157,18 @@ private func decodeArgsJson(_ s: String) -> [String] {
 final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
     private let runner = SingBoxRunner()
 
-    func ping(_ reply: @escaping () -> Void) {
-        reply()
+    @objc(pingWithReply:)
+    func pingWithReply(_ reply: @escaping (String) -> Void) {
+        reply("pong (pid=\(getpid()))")
     }
 
     @objc(startSingBox:configPath:argsJson:reply:)
-    func startSingBox(_ singBoxPath: String,
+    func startSingBox(
+    _ singBoxPath: String,
     configPath: String,
     argsJson: String,
-    reply: @escaping (Int32, String) -> Void) {
+    reply: @escaping (Int32, String) -> Void
+    ) {
         let extraArgs = decodeArgsJson(argsJson)
         do {
             let msg = try runner.start(singBoxPath: singBoxPath, configPath: configPath, extraArgs: extraArgs)
@@ -184,20 +179,15 @@ final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
         }
     }
 
-    @objc(stopSingBox:)
-    func stopSingBox(_ reply: @escaping (Int32, String) -> Void) {
+    @objc(stopSingBoxWithReply:)
+    func stopSingBoxWithReply(_ reply: @escaping (Int32, String) -> Void) {
         reply(0, runner.stop())
     }
 
-    @objc(status:)
-    func status(_ reply: @escaping (Bool, Int32) -> Void) {
-        let (r, pid) = runner.isRunning()
-        reply(r, pid)
-    }
-
-    @objc(tailLogs:reply:)
-    func tailLogs(_ maxLines: Int32, reply: @escaping (String) -> Void) {
-        reply(runner.tailLogs(maxLines: Int(maxLines)))
+    @objc(statusWithReply:)
+    func statusWithReply(_ reply: @escaping (Bool, Int32) -> Void) {
+        let (running, pid) = runner.isRunning()
+        reply(running, pid)
     }
 }
 
@@ -214,14 +204,10 @@ final class ListenerDelegate: NSObject, NSXPCListenerDelegate {
     }
 }
 
-// MARK: - main
-
-let machServiceName = "ru.ravel.ultunnel-macos.helper"
-
-print("ultunnel helper started (pid=\(getpid()))")
+// MARK: - main (ВАЖНО: удерживаем delegate)
 
 let listener = NSXPCListener(machServiceName: machServiceName)
-let delegate = ListenerDelegate()
+let delegate = ListenerDelegate()          // strong ref
 listener.delegate = delegate
 listener.resume()
 

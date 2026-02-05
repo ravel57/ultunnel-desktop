@@ -1,25 +1,26 @@
 import Foundation
 
 @objc(UltunnelPrivilegedHelperProtocol)
-protocol UltunnelPrivilegedHelperProtocol {
-    func ping(_ reply: @escaping () -> Void)
+protocol UltunnelPrivilegedHelperProtocol: NSObjectProtocol {
+
+    // selector: pingWithReply:
+    @objc(pingWithReply:)
+    func pingWithReply(_ reply: @escaping (String) -> Void)
 
     // selector: startSingBox:configPath:argsJson:reply:
     @objc(startSingBox:configPath:argsJson:reply:)
     func startSingBox(
-    _ singBoxPath: String,
-    configPath: String,
-    argsJson: String,
-    reply: @escaping (Int32, String) -> Void
+        _ singBoxPath: String,
+        configPath: String,
+        argsJson: String,
+        reply: @escaping (Int32, String) -> Void
     )
 
+    // selector: stopSingBoxWithReply:
     @objc(stopSingBoxWithReply:)
-    func stopSingBox(withReply reply: @escaping (Int32, String) -> Void)
+    func stopSingBoxWithReply(_ reply: @escaping (Int32, String) -> Void)
 
+    // selector: statusWithReply:
     @objc(statusWithReply:)
-    optional func status(withReply reply: @escaping (Bool, Int32) -> Void)
-
-    // selector: tailLogs:reply:
-    @objc(tailLogs:reply:)
-    func tailLogs(_ maxLines: Int32, reply: @escaping (String) -> Void)
+    func statusWithReply(_ reply: @escaping (Bool, Int32) -> Void)
 }
