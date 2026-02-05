@@ -9,7 +9,6 @@ HELPER_ENTITLEMENTS_REL="${HELPER_ENTITLEMENTS_REL:-macos/helper/UltunnelPrivile
 APP_ENTITLEMENTS_REL="${APP_ENTITLEMENTS_REL:-macos/ultunnel.entitlements.plist}"
 
 # Notarization (optional)
-#   NOTARY_PROFILE=notary  NOTARY=1  ./package-macos.sh
 NOTARY="${NOTARY:-0}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 
@@ -22,6 +21,10 @@ if [[ ! -f "$APP_ENTITLEMENTS" ]]; then
   echo "Missing app entitlements: $APP_ENTITLEMENTS" >&2
   exit 1
 fi
+
+# ===== Cleanup any previously installed helper (same label) =====
+sudo launchctl bootout system "/Library/LaunchDaemons/$HELPER_LABEL.plist" 2>/dev/null || true
+sudo rm -f "/Library/LaunchDaemons/$HELPER_LABEL.plist" "/Library/PrivilegedHelperTools/$HELPER_LABEL" || true
 
 # ===== Helpers =====
 plist_set_or_add() {
@@ -36,6 +39,11 @@ plist_set_string() {
   esc="$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')"
   /usr/libexec/PlistBuddy -c "Set $keypath \"$esc\"" "$plist" 2>/dev/null || \
   /usr/libexec/PlistBuddy -c "Add $keypath string \"$esc\"" "$plist"
+}
+
+plist_delete_key() {
+  local plist="$1" keypath="$2"
+  /usr/libexec/PlistBuddy -c "Delete $keypath" "$plist" 2>/dev/null || true
 }
 
 get_tauri_identifier() {
@@ -83,7 +91,6 @@ mkdir -p "$LS_DIR"
 
 APP_BUNDLE_ID="$(get_tauri_identifier)"
 if [[ -z "$APP_BUNDLE_ID" ]]; then
-  # fallback: take what is already in Info.plist
   APP_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST" 2>/dev/null || true)"
 fi
 if [[ -z "$APP_BUNDLE_ID" ]]; then
@@ -91,7 +98,7 @@ if [[ -z "$APP_BUNDLE_ID" ]]; then
   exit 1
 fi
 
-# Ensure app Info.plist has correct CFBundleIdentifier (some earlier attempts overwrote it)
+# Ensure app Info.plist has correct CFBundleIdentifier
 plist_set_string "$INFO_PLIST" ":CFBundleIdentifier" "$APP_BUNDLE_ID"
 
 # ===== Sign inner Mach-O (excluding helper for now) =====
@@ -111,11 +118,23 @@ if [[ -z "$APP_REQ" ]]; then
   exit 1
 fi
 
-# ===== Build helper with correct SMAuthorizedClients embedded in __info_plist =====
+# ===== Helper paths =====
 HELPER_DIR="$ROOT/macos/helper"
 HELPER_BUILD="$HELPER_DIR/build-helper.sh"
-HELPER_PLIST_SRC="$HELPER_DIR/ru.ravel.ultunnel-macos.helper.plist"
 HELPER_ENTITLEMENTS="$ROOT/$HELPER_ENTITLEMENTS_REL"
+
+# Launchd plist source (в репозитории)
+HELPER_PLIST_SRC=""
+if [[ -f "$HELPER_DIR/ru.ravel.ultunnel-macos.helper.plist" ]]; then
+  HELPER_PLIST_SRC="$HELPER_DIR/ru.ravel.ultunnel-macos.helper.plist"
+elif [[ -f "$HELPER_DIR/UltunnelPrivilegedHelper/Helper/ru.ravel.ultunnel-macos.helper.plist" ]]; then
+  HELPER_PLIST_SRC="$HELPER_DIR/UltunnelPrivilegedHelper/Helper/ru.ravel.ultunnel-macos.helper.plist"
+else
+  echo "Missing helper launchd plist in helper dir" >&2
+  exit 1
+fi
+
+# Helper Info.plist (вшивается в бинарь как __info_plist)
 HELPER_INFO_PLIST_PROJECT="$HELPER_DIR/UltunnelPrivilegedHelper/Helper/Info.plist"
 
 if [[ ! -f "$HELPER_BUILD" ]]; then
@@ -135,43 +154,68 @@ if [[ ! -f "$HELPER_INFO_PLIST_PROJECT" ]]; then
   exit 1
 fi
 
-# Patch helper's project Info.plist (embedded into helper binary) for this packaging run
-TMP_HELPER_PLIST="$(mktemp)"
-cp -f "$HELPER_INFO_PLIST_PROJECT" "$TMP_HELPER_PLIST"
+# ===== Patch helper Info.plist + launchd plist TEMPORARILY =====
+TMP_HELPER_INFO="$(mktemp)"
+TMP_HELPER_LAUNCHD="$(mktemp)"
+cp -f "$HELPER_INFO_PLIST_PROJECT" "$TMP_HELPER_INFO"
+cp -f "$HELPER_PLIST_SRC" "$TMP_HELPER_LAUNCHD"
 
-# Ensure helper bundle id matches helper label
+restore_helper_plists() {
+  mv -f "$TMP_HELPER_INFO" "$HELPER_INFO_PLIST_PROJECT" 2>/dev/null || true
+  mv -f "$TMP_HELPER_LAUNCHD" "$HELPER_PLIST_SRC" 2>/dev/null || true
+}
+trap restore_helper_plists EXIT
+
+# 1) Info.plist: CFBundleIdentifier + SMAuthorizedClients = [APP_REQ]
 plist_set_string "$HELPER_INFO_PLIST_PROJECT" ":CFBundleIdentifier" "$HELPER_LABEL"
-
-# Set SMAuthorizedClients = [ APP_REQ ]
-/usr/libexec/PlistBuddy -c "Delete :SMAuthorizedClients" "$HELPER_INFO_PLIST_PROJECT" 2>/dev/null || true
-/usr/libexec/PlistBuddy -c "Add :SMAuthorizedClients array" "$HELPER_INFO_PLIST_PROJECT"
+plist_delete_key "$HELPER_INFO_PLIST_PROJECT" ":SMAuthorizedClients"
+plist_set_or_add "$HELPER_INFO_PLIST_PROJECT" ":SMAuthorizedClients" "array" ""
 plist_set_string "$HELPER_INFO_PLIST_PROJECT" ":SMAuthorizedClients:0" "$APP_REQ"
 
-# Build helper (build-helper.sh prints path on last line)
-set +e
-HELPER_BIN="$(bash "$HELPER_BUILD" 2>/dev/null | tail -n 1)"
-HELPER_BUILD_RC=$?
-set -e
+# 2) launchd plist: Label + ProgramArguments[0] + MachServices[HELPER_LABEL]=true
+plist_set_string "$HELPER_PLIST_SRC" ":Label" "$HELPER_LABEL"
 
-# Restore helper Info.plist in repo
-mv -f "$TMP_HELPER_PLIST" "$HELPER_INFO_PLIST_PROJECT"
+plist_delete_key "$HELPER_PLIST_SRC" ":Program"
+plist_delete_key "$HELPER_PLIST_SRC" ":ProgramArguments"
+plist_set_or_add "$HELPER_PLIST_SRC" ":ProgramArguments" "array" ""
+plist_set_string "$HELPER_PLIST_SRC" ":ProgramArguments:0" "/Library/PrivilegedHelperTools/$HELPER_LABEL"
 
-if [[ $HELPER_BUILD_RC -ne 0 || ! -f "${HELPER_BIN:-}" ]]; then
+plist_delete_key "$HELPER_PLIST_SRC" ":MachServices"
+plist_set_or_add "$HELPER_PLIST_SRC" ":MachServices" "dict" ""
+plist_set_or_add "$HELPER_PLIST_SRC" ":MachServices:$HELPER_LABEL" "bool" "true"
+
+plist_set_or_add "$HELPER_PLIST_SRC" ":RunAtLoad" "bool" "true"
+
+# ===== Build helper (Swift helper; must contain embedded __info_plist and __launchd_plist) =====
+HELPER_BIN="$(LABEL="$HELPER_LABEL" OUT_DIR="$(mktemp -d -t ultunnel-helper-out.XXXXXX)" bash "$HELPER_BUILD" | tail -n 1)"
+if [[ -z "${HELPER_BIN:-}" || ! -f "$HELPER_BIN" ]]; then
   echo "Helper build failed or helper binary not found: ${HELPER_BIN:-<empty>}" >&2
   exit 1
 fi
 
+# Restore repo plists now (so packaging doesn't leave workspace dirty)
+restore_helper_plists
+trap - EXIT
+
 # ===== Embed helper into .app =====
 cp -f "$HELPER_BIN" "$LS_DIR/$HELPER_LABEL"
 cp -f "$HELPER_PLIST_SRC" "$LS_DIR/$HELPER_LABEL.plist"
+
 chmod 755 "$LS_DIR/$HELPER_LABEL" || true
+chmod 644 "$LS_DIR/$HELPER_LABEL.plist" || true
 
-# Patch embedded launchd plist's SMAuthorizedClients to match APP_REQ
-/usr/libexec/PlistBuddy -c "Delete :SMAuthorizedClients" "$LS_DIR/$HELPER_LABEL.plist" 2>/dev/null || true
-/usr/libexec/PlistBuddy -c "Add :SMAuthorizedClients array" "$LS_DIR/$HELPER_LABEL.plist"
-plist_set_string "$LS_DIR/$HELPER_LABEL.plist" ":SMAuthorizedClients:0" "$APP_REQ"
+# Patch embedded launchd plist too (must match exactly)
+plist_set_string "$LS_DIR/$HELPER_LABEL.plist" ":Label" "$HELPER_LABEL"
+plist_delete_key "$LS_DIR/$HELPER_LABEL.plist" ":Program"
+plist_delete_key "$LS_DIR/$HELPER_LABEL.plist" ":ProgramArguments"
+plist_set_or_add "$LS_DIR/$HELPER_LABEL.plist" ":ProgramArguments" "array" ""
+plist_set_string "$LS_DIR/$HELPER_LABEL.plist" ":ProgramArguments:0" "/Library/PrivilegedHelperTools/$HELPER_LABEL"
+plist_delete_key "$LS_DIR/$HELPER_LABEL.plist" ":MachServices"
+plist_set_or_add "$LS_DIR/$HELPER_LABEL.plist" ":MachServices" "dict" ""
+plist_set_or_add "$LS_DIR/$HELPER_LABEL.plist" ":MachServices:$HELPER_LABEL" "bool" "true"
+plist_set_or_add "$LS_DIR/$HELPER_LABEL.plist" ":RunAtLoad" "bool" "true"
 
-# Sign helper inside bundle (with hardened runtime + secure timestamp + NO get-task-allow)
+# ===== Sign helper inside bundle =====
 /usr/bin/codesign --force --options runtime --timestamp \
   --identifier "$HELPER_LABEL" \
   --entitlements "$HELPER_ENTITLEMENTS" \
@@ -184,7 +228,7 @@ if [[ -z "$HELPER_REQ" ]]; then
   exit 1
 fi
 
-# Inject SMPrivilegedExecutables[helper] into app Info.plist using *exact* designated requirement string
+# Inject SMPrivilegedExecutables[helper] into app Info.plist using exact helper requirement string
 HELPER_REQ_ESC="$(printf '%s' "$HELPER_REQ" | sed 's/\\/\\\\/g; s/"/\\"/g')"
 /usr/libexec/PlistBuddy -c "Add :SMPrivilegedExecutables dict" "$INFO_PLIST" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Delete :SMPrivilegedExecutables:$HELPER_LABEL" "$INFO_PLIST" 2>/dev/null || true
@@ -196,6 +240,7 @@ HELPER_REQ_ESC="$(printf '%s' "$HELPER_REQ" | sed 's/\\/\\\\/g; s/"/\\"/g')"
   --sign "$SIGN_IDENTITY" \
   "$APP_PATH"
 
+# Verify
 /usr/bin/codesign --verify --strict --verbose=2 "$APP_PATH"
 /usr/sbin/spctl --assess --type execute --verbose=4 "$APP_PATH" || true
 
@@ -221,7 +266,7 @@ hdiutil create \
 
 rm -rf "$STAGE"
 
-# Sign DMG (timestamp is useful for distribution, runtime option is not needed)
+# Sign DMG
 /usr/bin/codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG_OUT" || true
 /usr/bin/codesign --verify --verbose=2 "$DMG_OUT" || true
 

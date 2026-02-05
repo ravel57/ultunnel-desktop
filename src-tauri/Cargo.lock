@@ -4666,8 +4666,9 @@ dependencies = [
 
 [[package]]
 name = "ultunnel-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "cc",
  "reqwest",
  "runas",
  "serde",
@@ -4676,7 +4677,6 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tauri-plugin-shell",
- "tokio",
 ]
 
 [[package]]

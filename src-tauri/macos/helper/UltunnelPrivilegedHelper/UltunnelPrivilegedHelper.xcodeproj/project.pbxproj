@@ -29,10 +29,6 @@
 		4BE136BA2F3152E60059475A /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		4BE136BB2F3152E60059475A /* ru.ravel.ultunnel-macos.helper.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "ru.ravel.ultunnel-macos.helper.plist"; sourceTree = "<group>"; };
 		4BF086012F312D37009BEA5B /* UltunnelPrivilegedHelper */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = UltunnelPrivilegedHelper; sourceTree = BUILT_PRODUCTS_DIR; };
-		4BF0860D2F312DED009BEA5B /* HelperProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HelperProtocol.swift; sourceTree = "<group>"; };
-		4BF0860E2F312DED009BEA5B /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		4BF0860F2F312DED009BEA5B /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
-		4BF086102F312DED009BEA5B /* ru.ravel.ultunnel-macos.helper.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "ru.ravel.ultunnel-macos.helper.plist"; sourceTree = "<group>"; };
 		4BF086132F312DEF009BEA5B /* UltunnelPrivilegedHelper-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "UltunnelPrivilegedHelper-Bridging-Header.h"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -62,10 +58,6 @@
 			isa = PBXGroup;
 			children = (
 				4BE136BC2F3152E60059475A /* Helper */,
-				4BF0860D2F312DED009BEA5B /* HelperProtocol.swift */,
-				4BF0860E2F312DED009BEA5B /* Info.plist */,
-				4BF0860F2F312DED009BEA5B /* main.swift */,
-				4BF086102F312DED009BEA5B /* ru.ravel.ultunnel-macos.helper.plist */,
 				4BF086022F312D37009BEA5B /* Products */,
 				4BF086132F312DEF009BEA5B /* UltunnelPrivilegedHelper-Bridging-Header.h */,
 			);
@@ -182,10 +174,15 @@
 				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_ENTITLEMENTS = "/Users/petr/dev/RustroverProjects/ultunnel-desktop/src-tauri/macos/helper/UltunnelPrivilegedHelper/UltunnelPrivilegedHelper.entitlements";
+				CODE_SIGN_IDENTITY = "Developer ID Application: Petr Lomakin (ASMHMRKL3K)";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application: Petr Lomakin (ASMHMRKL3K)";
+				CODE_SIGN_STYLE = Manual;
 				COPY_PHASE_STRIP = NO;
 				CREATE_INFOPLIST_SECTION_IN_BINARY = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = ASMHMRKL3K;
+				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -255,10 +252,15 @@
 				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_ENTITLEMENTS = "/Users/petr/dev/RustroverProjects/ultunnel-desktop/src-tauri/macos/helper/UltunnelPrivilegedHelper/UltunnelPrivilegedHelper.entitlements";
+				CODE_SIGN_IDENTITY = "Developer ID Application: Petr Lomakin (ASMHMRKL3K)";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application: Petr Lomakin (ASMHMRKL3K)";
+				CODE_SIGN_STYLE = Manual;
 				COPY_PHASE_STRIP = NO;
 				CREATE_INFOPLIST_SECTION_IN_BINARY = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = ASMHMRKL3K;
+				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -289,9 +291,12 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CLANG_ENABLE_MODULES = YES;
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_ENTITLEMENTS = "/Users/petr/dev/RustroverProjects/ultunnel-desktop/src-tauri/macos/helper/UltunnelPrivilegedHelper/UltunnelPrivilegedHelper.entitlements";
+				CODE_SIGN_IDENTITY = "Developer ID Application: Petr Lomakin (ASMHMRKL3K)";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application";
+				CODE_SIGN_STYLE = Manual;
 				DEVELOPMENT_TEAM = ASMHMRKL3K;
+				"DEVELOPMENT_TEAM[sdk=macosx*]" = ASMHMRKL3K;
 				ENABLE_HARDENED_RUNTIME = YES;
 				MACOSX_DEPLOYMENT_TARGET = 11.5;
 				OTHER_LDFLAGS = "";
@@ -307,15 +312,19 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CLANG_ENABLE_MODULES = YES;
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_ENTITLEMENTS = "/Users/petr/dev/RustroverProjects/ultunnel-desktop/src-tauri/macos/helper/UltunnelPrivilegedHelper/UltunnelPrivilegedHelper.entitlements";
+				CODE_SIGN_IDENTITY = "Developer ID Application: Petr Lomakin (ASMHMRKL3K)";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application";
+				CODE_SIGN_STYLE = Manual;
 				CREATE_INFOPLIST_SECTION_IN_BINARY = YES;
 				DEVELOPMENT_TEAM = ASMHMRKL3K;
+				"DEVELOPMENT_TEAM[sdk=macosx*]" = ASMHMRKL3K;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Helper/Info.plist;
 				MACOSX_DEPLOYMENT_TARGET = 11.5;
 				OTHER_LDFLAGS = "";
+				PRODUCT_BUNDLE_IDENTIFIER = "ru.ravel.ultunnel-macos.helper";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OBJC_BRIDGING_HEADER = "UltunnelPrivilegedHelper-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;

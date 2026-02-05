@@ -5,24 +5,28 @@
   <key>Label</key>
   <string>ru.ravel.ultunnel-macos.helper</string>
 
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Library/PrivilegedHelperTools/ru.ravel.ultunnel-macos.helper</string>
+  </array>
+
   <key>MachServices</key>
   <dict>
     <key>ru.ravel.ultunnel-macos.helper</key>
     <true/>
   </dict>
 
-  <key>ProgramArguments</key>
-  <array>
-    <string>/Library/PrivilegedHelperTools/ru.ravel.ultunnel-macos.helper</string>
-  </array>
-
   <key>RunAtLoad</key>
   <true/>
 
-  <key>UserName</key>
-  <string>root</string>
-
   <key>KeepAlive</key>
-  <false/>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/var/log/ultunnel-helper.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/var/log/ultunnel-helper.err.log</string>
+
 </dict>
 </plist>

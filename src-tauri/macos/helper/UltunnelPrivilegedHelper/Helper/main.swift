@@ -1,86 +1,225 @@
 import Foundation
+import OSLog
 
-final class SingBoxRunner {
+let log = Logger(subsystem: "ru.ravel.ultunnel-macos.helper", category: "main")
+log.info("helper started")
+
+final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
+    private let q = DispatchQueue(label: "ru.ravel.ultunnel.helper.singbox")
     private var process: Process?
+    private var stdoutPipe: Pipe?
+    private var stderrPipe: Pipe?
 
-    // Поменяйте, если sing-box лежит в другом месте.
-    // Важно: у root-launchd может не быть PATH, поэтому только абсолютный путь.
-    private let singBoxPath = "/Applications/ultunnel-desktop.app/Contents/MacOS/sing-box"
+    private var ring: [String] = []
+    private let ringMax = 800
 
-    func start(configPath: String) throws -> String {
-        if let p = process, p.isRunning {
-            return "already running (pid=\(p.processIdentifier))"
+    func tailLogs(maxLines: Int) -> String {
+        return q.sync {
+            let n = max(0, min(maxLines, ring.count))
+            return ring.suffix(n).joined(separator: "\n")
         }
-
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: singBoxPath)
-        p.arguments = ["run", "-c", configPath]
-
-        // Желательно задать минимальный env
-        p.environment = [
-            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        ]
-
-        // (опционально) вывод в лог-файлы:
-        // let out = FileHandle(forWritingAtPath: "/var/log/ultunnel-singbox.log")
-        // p.standardOutput = out
-        // p.standardError = out
-
-        try p.run()
-        process = p
-        return "started pid=\(p.processIdentifier)"
     }
 
-    func stop() -> String {
-        guard let p = process, p.isRunning else {
-            process = nil
-            return "not running"
-        }
-        p.terminate()
-        process = nil
-        return "stopped"
+    func startSingBox(_ singBoxPath: String,
+                    configPath: String,
+                    argsJson: String,
+                    reply: @escaping (Int32, String) -> Void) {
+      if process != nil {
+          reply(1, "already running")
+          return
     }
 
     func isRunning() -> (Bool, Int32) {
-        if let p = process, p.isRunning {
-            return (true, p.processIdentifier)
+        return q.sync {
+            if let p = process, p.isRunning { return (true, p.processIdentifier) }
+            return (false, 0)
         }
-        return (false, 0)
+    }
+
+    func stop() -> String {
+        return q.sync {
+            guard let p = process else { return "not running" }
+            if p.isRunning {
+                p.terminate()
+            }
+            process = nil
+            stdoutPipe?.fileHandleForReading.readabilityHandler = nil
+            stderrPipe?.fileHandleForReading.readabilityHandler = nil
+            stdoutPipe = nil
+            stderrPipe = nil
+            return "stopped"
+        }
+    }
+
+    func start(singBoxPath: String, configPath: String, extraArgs: [String]) throws -> String {
+        try q.sync {
+            if let p = process, p.isRunning {
+                return "already running (pid=\(p.processIdentifier))"
+            }
+
+            guard FileManager.default.isExecutableFile(atPath: singBoxPath) else {
+                throw NSError(
+                    domain: "SingBoxRunner",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "sing-box not executable or not found: \(singBoxPath)"]
+                )
+            }
+            guard FileManager.default.fileExists(atPath: configPath) else {
+                throw NSError(
+                    domain: "SingBoxRunner",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "config not found: \(configPath)"]
+                )
+            }
+
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: singBoxPath)
+
+            // Базовые аргументы + то, что пришло из argsJson
+            var args: [String] = ["run", "-c", configPath]
+            args.append(contentsOf: extraArgs)
+            p.arguments = args
+
+            // launchd часто стартует с пустым окружением
+            p.environment = [
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "HOME": "/var/root"
+            ]
+
+            let out = Pipe()
+            let err = Pipe()
+            stdoutPipe = out
+            stderrPipe = err
+            p.standardOutput = out
+            p.standardError = err
+
+            func attachReader(_ pipe: Pipe, prefix: String) {
+                pipe.fileHandleForReading.readabilityHandler = { [weak self] fh in
+                    let data = fh.availableData
+                    if data.isEmpty { return }
+                    if let s = String(data: data, encoding: .utf8) {
+                        self?.appendLog(prefix: prefix, text: s)
+                    } else {
+                        self?.appendLog(prefix: prefix, text: "<non-utf8 \(data.count) bytes>")
+                    }
+                }
+            }
+            attachReader(out, prefix: "OUT")
+            attachReader(err, prefix: "ERR")
+
+            p.terminationHandler = { [weak self] proc in
+                self?.appendLog(prefix: "PROC", text: "terminated status=\(proc.terminationStatus) reason=\(proc.terminationReason.rawValue)")
+                self?.q.async {
+                    self?.process = nil
+                    self?.stdoutPipe?.fileHandleForReading.readabilityHandler = nil
+                    self?.stderrPipe?.fileHandleForReading.readabilityHandler = nil
+                    self?.stdoutPipe = nil
+                    self?.stderrPipe = nil
+                }
+            }
+
+            try p.run()
+            process = p
+            appendLog(prefix: "PROC", text: "started pid=\(p.processIdentifier) exe=\(singBoxPath) args=\(args)")
+            return "started pid=\(p.processIdentifier))"
+        }
+    }
+
+    private func appendLog(prefix: String, text: String) {
+        q.async {
+            let normalized = text.replacingOccurrences(of: "\r", with: "")
+            let lines = normalized
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { "[\(prefix)] \($0)" }
+
+            for l in lines {
+                self.ring.append(l)
+            }
+            if self.ring.count > self.ringMax {
+                self.ring.removeFirst(self.ring.count - self.ringMax)
+            }
+        }
     }
 }
 
-final class Helper: NSObject, HelperProtocol {
+// MARK: - JSON utils
+
+private func decodeArgsJson(_ s: String) -> [String] {
+    let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty { return [] }
+
+    // Ожидаем JSON-массив строк: ["--foo","bar"]
+    guard let data = trimmed.data(using: .utf8) else { return [] }
+
+    do {
+        let obj = try JSONSerialization.jsonObject(with: data, options: [])
+        if let arr = obj as? [String] { return arr }
+        return []
+    } catch {
+        return []
+    }
+}
+
+// MARK: - XPC Helper
+
+final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
     private let runner = SingBoxRunner()
 
-    func startSingBox(configPath: String, reply: @escaping (Int32, String) -> Void) {
+    func ping(_ reply: @escaping () -> Void) {
+        reply()
+    }
+
+    @objc(startSingBox:configPath:argsJson:reply:)
+    func startSingBox(_ singBoxPath: String,
+    configPath: String,
+    argsJson: String,
+    reply: @escaping (Int32, String) -> Void) {
+        let extraArgs = decodeArgsJson(argsJson)
         do {
-            let res = try runner.start(configPath: configPath)
-            reply(0, res)
+            let msg = try runner.start(singBoxPath: singBoxPath, configPath: configPath, extraArgs: extraArgs)
+            reply(0, msg)
         } catch {
-            reply(1, "failed: \(error)")
+            let logs = runner.tailLogs(maxLines: 120)
+            reply(1, "failed: \(error)\nLast logs:\n\(logs)")
         }
     }
 
-    func stopSingBox(reply: @escaping (Int32, String) -> Void) {
+    @objc(stopSingBox:)
+    func stopSingBox(_ reply: @escaping (Int32, String) -> Void) {
         reply(0, runner.stop())
     }
 
-    func status(reply: @escaping (Bool, Int32) -> Void) {
+    @objc(status:)
+    func status(_ reply: @escaping (Bool, Int32) -> Void) {
         let (r, pid) = runner.isRunning()
         reply(r, pid)
     }
+
+    @objc(tailLogs:reply:)
+    func tailLogs(_ maxLines: Int32, reply: @escaping (String) -> Void) {
+        reply(runner.tailLogs(maxLines: Int(maxLines)))
+    }
 }
 
+// MARK: - NSXPCListener
+
 final class ListenerDelegate: NSObject, NSXPCListenerDelegate {
+    private let helper = Helper()
+
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection c: NSXPCConnection) -> Bool {
-        c.exportedInterface = NSXPCInterface(with: HelperProtocol.self)
-        c.exportedObject = Helper()
+        c.exportedInterface = NSXPCInterface(with: UltunnelPrivilegedHelperProtocol.self)
+        c.exportedObject = helper
         c.resume()
         return true
     }
 }
 
+// MARK: - main
+
 let machServiceName = "ru.ravel.ultunnel-macos.helper"
+
+print("ultunnel helper started (pid=\(getpid()))")
+
 let listener = NSXPCListener(machServiceName: machServiceName)
 let delegate = ListenerDelegate()
 listener.delegate = delegate

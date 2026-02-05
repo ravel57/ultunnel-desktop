@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>ru.ravel.ultunnel-macos.helper</string>
+	<key>CFBundleName</key>
+	<string>UltunnelPrivilegedHelper</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>SMAuthorizedClients</key>
+	<array>
+		<string>identifier "ru.ravel.ultunnel-macos" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ASMHMRKL3K</string>
+		<!--string>identifier "ru.ravel.ultunnel-macos" and anchor apple generic and certificate leaf[subject.OU] = ASMHMRKL3K</string-->
+	</array>
+</dict>
+</plist>
