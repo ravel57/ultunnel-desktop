@@ -225,13 +225,8 @@ pub async fn singbox_start_root(config_path: String, args: Option<Vec<String>>) 
             return Err(format!("config not found at: {}", cfg.display()));
         }
 
-        let args_vec = args.unwrap_or_else(|| vec![
-            "run".to_string(),
-            "-c".to_string(),
-            cfg.to_string_lossy().to_string(),
-        ]);
+        let args_vec = args.unwrap_or_default();
 
-        // 3) стартуем от рута через XPC в helper
         macos_smjobbless::helper_start_singbox(HELPER_LABEL, &singbox_path, &cfg, &args_vec)?;
         Ok(())
     }
