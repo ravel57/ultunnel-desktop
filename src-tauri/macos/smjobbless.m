@@ -84,19 +84,18 @@ int smjobbless_install(const char *label_c, char **error_out) {
 //   tailLogs(_:reply:)                                          => tailLogs:reply:
 
 @protocol UltunnelPrivilegedHelperProtocol
-- (void)ping:(void (^)(void))reply;
+- (void)pingWithReply:(void (^)(NSString *msg))reply;
 
 - (void)startSingBox:(NSString *)singBoxPath
           configPath:(NSString *)configPath
             argsJson:(NSString *)argsJson
                reply:(void (^)(int32_t code, NSString *msg))reply;
 
-- (void)stopSingBox:(void (^)(int32_t code, NSString *msg))reply;
+- (void)stopSingBoxWithReply:(void (^)(int32_t code, NSString *msg))reply;
 
-- (void)status:(void (^)(BOOL running, int32_t pid))reply;
-
-- (void)tailLogs:(int32_t)maxLines reply:(void (^)(NSString *text))reply;
+- (void)statusWithReply:(void (^)(BOOL running, int32_t pid))reply;
 @end
+
 
 static NSArray<NSString *> *parse_args_json(NSString *argsJson, NSString **errOut) {
   if (!argsJson.length) return @[];
@@ -245,7 +244,7 @@ int smhelper_stop_singbox(const char *label_c, char **error_out) {
     }
 
     return call_helper(label, ^(id<UltunnelPrivilegedHelperProtocol> remote, void (^done)(BOOL ok, NSString *err)) {
-      [remote stopSingBox:^(int32_t code, NSString *msg) {
+      [remote stopSingBoxWithReply:^(int32_t code, NSString *msg) {
         BOOL success = (code == 0);
         done(success, msg ?: @"");
       }];
@@ -265,7 +264,7 @@ int smhelper_status(const char *label_c, int *running_out, int *code_out, char *
     __block int pidVal = 0;
 
     int ok = call_helper(label, ^(id<UltunnelPrivilegedHelperProtocol> remote, void (^done)(BOOL ok, NSString *err)) {
-      [remote status:^(BOOL running, int32_t pid) {
+      [remote statusWithReply:^(BOOL running, int32_t pid) {
         runningVal = running ? 1 : 0;
         pidVal = (int)pid;
         done(YES, nil);

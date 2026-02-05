@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import Darwin
 
 private let machServiceName = "ru.ravel.ultunnel-macos.helper"
 private let log = Logger(subsystem: machServiceName, category: "main")
@@ -33,16 +34,37 @@ final class SingBoxRunner {
 
     func stop() -> String {
         q.sync {
-            guard let p = process else { return "not running" }
-            if p.isRunning { p.terminate() }
+            if let p = process {
+                let pid = p.processIdentifier
+                if p.isRunning { p.terminate() }
 
-            process = nil
-            stdoutPipe?.fileHandleForReading.readabilityHandler = nil
-            stderrPipe?.fileHandleForReading.readabilityHandler = nil
-            stdoutPipe = nil
-            stderrPipe = nil
-
-            return "stopped"
+                var waitedMs = 0
+                while p.isRunning && waitedMs < 2000 {
+                    usleep(50_000); waitedMs += 50
+                }
+                if p.isRunning { _ = Darwin.kill(pid_t(pid), SIGKILL) }
+                p.waitUntilExit()
+                process = nil
+            }
+            if let s = try? String(contentsOfFile: "/var/run/ultunnel-singbox.pid", encoding: .utf8),
+            let pid = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)),
+            pid > 1 {
+                _ = Darwin.kill(pid, SIGTERM)
+                var waitedMs = 0
+                while waitedMs < 2000 {
+                    if Darwin.kill(pid, 0) != 0 { break } // процесса нет
+                    usleep(50_000); waitedMs += 50
+                }
+                if Darwin.kill(pid, 0) == 0 {
+                    _ = Darwin.kill(pid, SIGKILL)
+                }
+                try? FileManager.default.removeItem(atPath: "/var/run/ultunnel-singbox.pid")
+                return "stopped pid=\(pid)"
+            }
+            runCmd("/usr/bin/pkill", ["-TERM", "-x", "sing-box"])
+            usleep(100_000)
+            runCmd("/usr/bin/pkill", ["-KILL", "-x", "sing-box"])
+            return "stopped (fallback)"
         }
     }
 
@@ -114,6 +136,11 @@ final class SingBoxRunner {
 
             try p.run()
             process = p
+            try? "\(p.processIdentifier)".write(
+                toFile: "/var/run/ultunnel-singbox.pid",
+                atomically: true,
+                encoding: .utf8
+            )
             appendLog(prefix: "PROC", text: "started pid=\(p.processIdentifier) exe=\(singBoxPath) args=\(args)")
             return "started pid=\(p.processIdentifier)"
         }
@@ -131,6 +158,18 @@ final class SingBoxRunner {
             if self.ring.count > self.ringMax {
                 self.ring.removeFirst(self.ring.count - self.ringMax)
             }
+        }
+    }
+
+    private func runCmd(_ path: String, _ args: [String]) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        do {
+            try p.run()
+            p.waitUntilExit()
+        } catch {
+            // игнор — это fallback
         }
     }
 }

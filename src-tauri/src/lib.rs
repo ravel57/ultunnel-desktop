@@ -28,6 +28,7 @@ use tauri::State;
 use tauri::WindowEvent;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::process::CommandChild;
+use std::process::Command;
 
 #[cfg(target_os = "macos")]
 const HELPER_LABEL: &str = "ru.ravel.ultunnel-macos.helper";
@@ -154,6 +155,7 @@ fn write_singbox_config(
     #[cfg(target_os = "macos")]
     {
         patch_config_for_macos(&mut v);
+        patch_config_for_macos_process_rules(&mut v, settings);
     }
 
     #[cfg(target_os = "windows")]
@@ -220,7 +222,7 @@ pub async fn singbox_start_root(config_path: String, args: Option<Vec<String>>) 
             return Err(format!("sing-box not found at: {}", singbox_path.display()));
         }
 
-        let cfg = std::path::PathBuf::from(config_path);
+        let cfg = PathBuf::from(config_path);
         if !cfg.exists() {
             return Err(format!("config not found at: {}", cfg.display()));
         }
@@ -245,8 +247,18 @@ async fn singbox_stop_root(app: AppHandle) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     {
-        let _ = install_helper_if_needed()?; //run_helper_installer(&app, &["stop"])?;
-        let _ =macos_smjobbless::helper_stop_singbox(HELPER_LABEL);
+        install_helper_if_needed()?;
+        let _ = install_helper_if_needed();
+        let _ = macos_smjobbless::helper_stop_singbox(HELPER_LABEL)?;
+        let _ = Command::new("/usr/bin/pkill")
+            .args(["-x", "sing-box"])
+            .status();
+        let _ = Command::new("/usr/bin/killall")
+            .args(["sing-box"])
+            .status();
+        let _ = Command::new("/usr/bin/pkill")
+            .args(["-f", "sing-box"])
+            .status();
         Ok(())
     }
 }
@@ -404,6 +416,10 @@ pub fn run() {
             get_socks5_inbound,
             set_socks5_inbound,
             install_helper_if_needed,
+            list_running_processes,
+            get_macos_tunneled_processes,
+            set_macos_tunneled_processes,
+            set_macos_process_tunnel_enabled,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -912,9 +928,24 @@ fn list_running_apps() -> Result<Vec<RunningApp>, String> {
         return list_running_apps_windows();
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        Ok(vec![])
+        use sysinfo::System;
+        let mut sys = System::new_all();
+        sys.refresh_processes();
+        let mut out: Vec<RunningApp> = sys
+            .processes()
+            .iter()
+            .map(|(pid, proc_)| RunningApp {
+                pid: pid.to_string().parse::<u32>().unwrap_or(0),
+                name: proc_.name().to_string(),
+                path: proc_.exe().map(|p| p.display().to_string()),
+                title: None,
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out.dedup_by(|a, b| a.pid == b.pid);
+        Ok(out)
     }
 }
 
@@ -1114,4 +1145,95 @@ fn apply_socks5_inbound(cfg: &mut serde_json::Value, enabled: bool, proxy_outbou
             }),
         );
     }
+}
+
+#[tauri::command]
+fn list_running_processes() -> Result<Vec<RunningApp>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use sysinfo::System;
+
+        let mut sys = System::new_all();
+        sys.refresh_processes();
+
+        let mut out: Vec<RunningApp> = sys
+            .processes()
+            .iter()
+            .map(|(pid, proc_)| {
+                let pid_u32: u32 = pid.to_string().parse::<u32>().unwrap_or(0);
+                RunningApp {
+                    pid: pid_u32,
+                    name: proc_.name().to_string(),
+                    path: proc_.exe().map(|p| p.display().to_string()),
+                    title: None,
+                }
+            })
+            .collect();
+
+        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        Ok(out)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("list_running_processes реализована только для macOS".to_string())
+    }
+}
+
+/* TODO remove below */
+#[tauri::command]
+fn get_macos_tunneled_processes(state: SharedState) -> Vec<String> {
+    state.settings.lock().unwrap().macos_tunneled_processes.clone()
+}
+
+#[tauri::command]
+fn set_macos_tunneled_processes(state: SharedState, processes: Vec<String>) -> Result<(), String> {
+    let mut s = state.settings.lock().unwrap();
+    let mut p = processes;
+    p.sort();
+    p.dedup();
+    s.macos_tunneled_processes = p;
+    s.save(&state.settings_path)
+}
+
+#[tauri::command]
+fn set_macos_process_tunnel_enabled(state: SharedState, enabled: bool) -> Result<(), String> {
+    let mut s = state.settings.lock().unwrap();
+    s.macos_process_tunnel_enabled = enabled;
+    s.save(&state.settings_path)
+}
+/* TODO remove upper */
+
+#[cfg(target_os = "macos")]
+fn patch_config_for_macos_process_rules(cfg: &mut Value, settings: &LocalSettings) {
+    if !settings.macos_process_tunnel_enabled {
+        return;
+    }
+
+    let processes = settings
+        .macos_tunneled_processes
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    if processes.is_empty() {
+        return;
+    }
+    let route = cfg.as_object_mut()
+        .and_then(|root| root.get_mut("route"))
+        .and_then(|v| v.as_object_mut());
+    if route.is_none() {
+        // если route отсутствует — создаем
+        if let Some(root) = cfg.as_object_mut() {
+            root.insert("route".to_string(), serde_json::json!({}));
+        }
+    }
+    let route = cfg.get_mut("route").and_then(|v| v.as_object_mut()).unwrap();
+    let rules = route.entry("rules".to_string()).or_insert_with(|| serde_json::json!([]));
+    let rules_arr = rules.as_array_mut().unwrap();
+    let rule = json!({
+        "process_name": processes,
+        "outbound": settings.split_routing.proxy_outbound
+    });
+    rules_arr.insert(0, rule);
 }
