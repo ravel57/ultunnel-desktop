@@ -23,3 +23,4 @@ tauri-plugin-shell = "2"
 reqwest = { version = "0.12.24", features = ["blocking", "json", "rustls-tls"] }
 tokio = "1.48.0"
 runas = "1"
+tauri-plugin-autostart = "2"

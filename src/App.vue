@@ -73,6 +73,24 @@
 					</div>
 				</div>
 
+				<div class="card">
+					<div class="cardTitle">Приложение</div>
+
+					<label class="row">
+						<input
+							type="checkbox"
+							v-model="autostartEnabled"
+							:disabled="autostartLoading"
+							@change="saveAutostart"
+						/>
+						<span>Автозапуск при старте системы</span>
+					</label>
+
+					<div class="muted" style="margin-top:6px" v-if="autostartNote">
+						{{ autostartNote }}
+					</div>
+				</div>
+
 				<!-- apps settings -->
 				<div class="card">
 					<div class="cardTitle">Маршрутизация</div>
@@ -365,6 +383,11 @@ export default defineComponent({
 		appsSearch: "" as string,
 
 		socks5Inbound: false,
+
+		autostartEnabled: false,
+		autostartOsEnabled: false,
+		autostartLoading: false,
+		autostartNote: '' as string,
 	}),
 
 	async created() {
@@ -580,6 +603,41 @@ export default defineComponent({
 				await invoke("singbox_stop_platform")
 				await invoke("singbox_start_platform")
 				this.isRunning = true
+			}
+		},
+
+		async loadAutostart() {
+			this.autostartNote = ''
+			this.autostartLoading = true
+			try {
+				const st = await invoke<{ desired: boolean; enabled: boolean }>('get_autostart_status')
+				this.autostartEnabled = !!st?.desired
+				this.autostartOsEnabled = !!st?.enabled
+
+				if (this.autostartOsEnabled !== this.autostartEnabled) {
+					this.autostartNote = this.autostartEnabled
+						? 'В системе автозапуск сейчас выключен. Включаю при следующем сохранении.'
+						: 'В системе автозапуск сейчас включен. Отключаю при следующем сохранении.'
+				} else {
+					this.autostartNote = this.autostartEnabled ? 'В системе: включено.' : 'В системе: выключено.'
+				}
+			} catch (e: any) {
+				this.autostartNote = String(e)
+			} finally {
+				this.autostartLoading = false
+			}
+		},
+
+		async saveAutostart() {
+			this.autostartNote = ''
+			this.autostartLoading = true
+			try {
+				await invoke<void>('set_autostart_enabled', { enabled: this.autostartEnabled })
+				await this.loadAutostart()
+			} catch (e: any) {
+				this.autostartNote = String(e)
+			} finally {
+				this.autostartLoading = false
 			}
 		},
 

@@ -60,6 +60,9 @@ pub struct LocalSettings {
 
     #[serde(default)]
     pub socks5_inbound: bool,
+
+	#[serde(default)]
+	pub autostart_enabled: bool,
 }
 
 impl Default for LocalSettings {
@@ -69,6 +72,7 @@ impl Default for LocalSettings {
             selected_config: None,
             split_routing: SplitRoutingSettings::default(),
             socks5_inbound: false,
+			autostart_enabled: true,
         }
     }
 }

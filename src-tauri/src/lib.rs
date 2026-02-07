@@ -26,6 +26,7 @@ use tauri::State;
 use tauri::WindowEvent;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::process::CommandChild;
+use tauri_plugin_autostart::MacosLauncher;
 
 static EXITING: AtomicBool = AtomicBool::new(false);
 
@@ -341,10 +342,20 @@ async fn load_configs(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, St
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_shell::init())
-        .setup(|app| {
+        .plugin(tauri_plugin_shell::init());
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        builder = builder.plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None
+        ));
+    }
+
+    let app = builder
+		.setup(|app| {
             let show = MenuItem::with_id(app, "show", "Показать/Скрыть", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
@@ -391,8 +402,8 @@ pub fn run() {
                 running: AtomicBool::new(false),
                 singbox: Mutex::new(None),
             });
-            app.manage(state);
-
+            app.manage(state.clone());
+            sync_autostart_on_startup(&handle, &state);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -419,6 +430,10 @@ pub fn run() {
             list_running_apps,
             get_socks5_inbound,
             set_socks5_inbound,
+
+            // добавь эти две:
+            get_autostart_status,
+            set_autostart_enabled,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1129,4 +1144,64 @@ fn apply_socks5_inbound(cfg: &mut serde_json::Value, enabled: bool, proxy_outbou
             }),
         );
     }
+}
+
+#[tauri::command]
+fn get_autostart_status(state: SharedState, app: AppHandle) -> Result<Value, String> {
+	let desired = state.settings.lock().unwrap().autostart_enabled;
+
+	#[cfg(any(target_os = "windows", target_os = "macos"))]
+	{
+		use tauri_plugin_autostart::ManagerExt;
+
+		let enabled = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
+		return Ok(serde_json::json!({
+            "desired": desired,
+            "enabled": enabled
+        }));
+	}
+
+	#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+	{
+		Ok(serde_json::json!({
+            "desired": desired,
+            "enabled": false
+        }))
+	}
+}
+
+#[tauri::command]
+fn set_autostart_enabled(state: SharedState, app: AppHandle, enabled: bool) -> Result<(), String> {
+	#[cfg(any(target_os = "windows", target_os = "macos"))]
+	{
+		use tauri_plugin_autostart::ManagerExt;
+
+		if enabled {
+			app.autolaunch().enable().map_err(|e| e.to_string())?;
+		} else {
+			app.autolaunch().disable().map_err(|e| e.to_string())?;
+		}
+	}
+
+	let mut s = state.settings.lock().unwrap();
+	s.autostart_enabled = enabled;
+	s.save(&state.settings_path)
+}
+
+fn sync_autostart_on_startup(app: &AppHandle, state: &Arc<AppState>) {
+	#[cfg(any(target_os = "windows", target_os = "macos"))]
+	{
+		use tauri_plugin_autostart::ManagerExt;
+
+		let desired = state.settings.lock().unwrap().autostart_enabled;
+		let mgr = app.autolaunch();
+
+		if let Ok(current) = mgr.is_enabled() {
+			if desired && !current {
+				let _ = mgr.enable();
+			} else if !desired && current {
+				let _ = mgr.disable();
+			}
+		}
+	}
 }
