@@ -344,7 +344,6 @@ function defaultSplit(): SplitRoutingSettings {
 
 import {defineComponent} from 'vue'
 import {invoke} from '@tauri-apps/api/core'
-// import { open } from '@tauri-apps/plugin-shell' // если нет — убери openLogs() или используй opener plugin
 
 export default defineComponent({
 	name: 'App',

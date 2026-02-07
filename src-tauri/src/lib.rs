@@ -1,4 +1,6 @@
 mod api;
+#[cfg(target_os = "macos")]
+mod macos_smjobbless;
 mod settings;
 
 use crate::settings::LocalSettings;
@@ -26,7 +28,12 @@ use tauri::State;
 use tauri::WindowEvent;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::process::CommandChild;
+use std::process::Command;
 use tauri_plugin_autostart::MacosLauncher;
+#[cfg(target_os = "macos")]
+const HELPER_LABEL: &str = "ru.ravel.ultunnel-macos.helper";
+#[cfg(target_os = "macos")]
+const HELPER_DST: &str = "/Library/PrivilegedHelperTools/ru.ravel.ultunnel-macos.helper";
 
 static EXITING: AtomicBool = AtomicBool::new(false);
 
@@ -102,20 +109,33 @@ fn get_profiles(state: State<'_, Arc<AppState>>) -> Vec<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn run_as_admin(script: &str) -> Result<(), String> {
-    let out = std::process::Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(format!(
-            r#"do shell script "{}" with administrator privileges"#,
-            script.replace('"', "\\\"")
-        ))
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if out.status.success() {
+#[tauri::command]
+fn install_helper_if_needed() -> Result<(), String> {
+    use std::path::Path;
+    if Path::new(HELPER_DST).exists() {
+        return Ok(());
+    }
+    macos_smjobbless::install_helper(HELPER_LABEL)?;
+    if Path::new(HELPER_DST).exists() {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).to_string())
+        Err(format!(
+            "SMJobBless reported success but helper not found at {}",
+            HELPER_DST
+        ))
+    }
+}
+
+#[tauri::command]
+fn install_privileged_helper() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        return install_helper_if_needed();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("install_privileged_helper поддержан только на macOS".to_string())
     }
 }
 
@@ -134,6 +154,7 @@ fn write_singbox_config(
     #[cfg(target_os = "macos")]
     {
         patch_config_for_macos(&mut v);
+        patch_config_for_macos_process_rules(&mut v, settings);
     }
 
     #[cfg(target_os = "windows")]
@@ -185,63 +206,39 @@ fn patch_config_for_windows(cfg: &mut serde_json::Value, split: &SplitRoutingSet
     }
 }
 
-#[tauri::command]
-async fn singbox_start_root(app: AppHandle, cfg_path: String) -> Result<(), String> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        return Err("macOS only".into());
-    }
-
+// #[tauri::command]
+pub async fn singbox_start_root(config_path: String, args: Option<Vec<String>>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let bin = std::env::current_exe()
-            .map_err(|e| e.to_string())?
-            .parent()
-            .ok_or("no exe parent".to_string())?
-            .join("sing-box");
+        install_privileged_helper().map_err(|e| e.to_string())?;
+        // 2) вычисляем путь до sing-box рядом с текущим exe
+        // /Applications/ultunnel-desktop.app/Contents/MacOS/ultunnel-desktop
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let macos_dir = exe.parent().ok_or("Cannot get Contents/MacOS dir")?;
+        let singbox_path = macos_dir.join("sing-box");
 
-        let root_dir = "/Library/Application Support/ultunnel";
-        let pid_file = "/Library/Application Support/ultunnel/singbox.pid";
-        let log_file = "/Library/Logs/ultunnel-singbox.log";
+        if !singbox_path.exists() {
+            return Err(format!("sing-box not found at: {}", singbox_path.display()));
+        }
 
-        let sh = format!(
-            r#"/bin/sh -lc '
-set -e
-mkdir -p "{root_dir}"
+        let cfg = PathBuf::from(config_path);
+        if !cfg.exists() {
+            return Err(format!("config not found at: {}", cfg.display()));
+        }
 
-# убить старый процесс
-if [ -f "{pid_file}" ]; then
-  old="$(cat "{pid_file}")"
-  if kill -0 "$old" 2>/dev/null; then
-    kill -TERM "$old" 2>/dev/null || true
-    sleep 0.7
-    kill -KILL "$old" 2>/dev/null || true
-  fi
-  rm -f "{pid_file}"
-fi
+        let args_vec = args.unwrap_or_default();
 
-: > "{log_file}"
-
-"{bin}" run -c "{cfg}" >> "{log_file}" 2>&1 < /dev/null &
-pid=$!
-echo "$pid" > "{pid_file}"
-
-sleep 0.5
-kill -0 "$pid" 2>/dev/null || {{ echo "sing-box died"; tail -n 120 "{log_file}"; exit 1; }}
-'"#,
-            root_dir = root_dir,
-            pid_file = pid_file,
-            log_file = log_file,
-            bin = bin.to_string_lossy().replace('"', r#"\""#),
-            cfg = cfg_path.replace('"', r#"\""#),
-        );
-
-        run_as_admin(&sh)
+        macos_smjobbless::helper_start_singbox(HELPER_LABEL, &singbox_path, &cfg, &args_vec)?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("not supported on non-macOS".to_string())
     }
 }
 
-#[tauri::command]
-async fn singbox_stop_root(_app: AppHandle) -> Result<(), String> {
+// #[tauri::command]
+async fn singbox_stop_root(app: AppHandle) -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     {
         return Err("macOS only".into());
@@ -249,23 +246,19 @@ async fn singbox_stop_root(_app: AppHandle) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     {
-        let pid_file = "/Library/Application Support/ultunnel/singbox.pid";
-        let sh = format!(
-            r#"/bin/sh -lc '
-set -e
-if [ -f "{pid}" ]; then
-  p="$(cat "{pid}")"
-  if kill -0 "$p" 2>/dev/null; then
-    kill -TERM "$p" 2>/dev/null || true
-    sleep 0.7
-    kill -KILL "$p" 2>/dev/null || true
-  fi
-  rm -f "{pid}"
-fi
-'"#,
-            pid = pid_file
-        );
-        run_as_admin(&sh)
+        install_helper_if_needed()?;
+        let _ = install_helper_if_needed();
+        let _ = macos_smjobbless::helper_stop_singbox(HELPER_LABEL)?;
+        let _ = Command::new("/usr/bin/pkill")
+            .args(["-x", "sing-box"])
+            .status();
+        let _ = Command::new("/usr/bin/killall")
+            .args(["sing-box"])
+            .status();
+        let _ = Command::new("/usr/bin/pkill")
+            .args(["-f", "sing-box"])
+            .status();
+        Ok(())
     }
 }
 
@@ -275,6 +268,7 @@ fn singbox_start_admin(app: AppHandle, cfg_path: String) -> Result<(), String> {
     {
         return Err("Windows only".into());
     }
+
     #[cfg(target_os = "windows")]
     {
         let exe_dir = std::env::current_exe()
@@ -420,8 +414,8 @@ pub fn run() {
             get_state,
             get_profiles,
             load_configs,
-            singbox_start_root,
-            singbox_stop_root,
+            // singbox_start_root,
+            // singbox_stop_root,
             singbox_start_platform,
             singbox_stop_platform,
             open_logs,
@@ -430,8 +424,11 @@ pub fn run() {
             list_running_apps,
             get_socks5_inbound,
             set_socks5_inbound,
-
-            // добавь эти две:
+            install_helper_if_needed,
+            list_running_processes,
+            get_macos_tunneled_processes,
+            set_macos_tunneled_processes,
+            set_macos_process_tunnel_enabled,
             get_autostart_status,
             set_autostart_enabled,
         ])
@@ -625,7 +622,7 @@ async fn singbox_start_platform(app: AppHandle, state: SharedState<'_>) -> Resul
 
     #[cfg(target_os = "macos")]
     {
-        let r = singbox_start_root(app, cfg_path_str).await;
+        let r = singbox_start_root(/*app,*/cfg_path_str, None).await;
         if r.is_ok() {
             state.running.store(true, Ordering::Relaxed);
         }
@@ -942,9 +939,24 @@ fn list_running_apps() -> Result<Vec<RunningApp>, String> {
         return list_running_apps_windows();
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        Ok(vec![])
+        use sysinfo::System;
+        let mut sys = System::new_all();
+        sys.refresh_processes();
+        let mut out: Vec<RunningApp> = sys
+            .processes()
+            .iter()
+            .map(|(pid, proc_)| RunningApp {
+                pid: pid.to_string().parse::<u32>().unwrap_or(0),
+                name: proc_.name().to_string(),
+                path: proc_.exe().map(|p| p.display().to_string()),
+                title: None,
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out.dedup_by(|a, b| a.pid == b.pid);
+        Ok(out)
     }
 }
 
@@ -1144,6 +1156,97 @@ fn apply_socks5_inbound(cfg: &mut serde_json::Value, enabled: bool, proxy_outbou
             }),
         );
     }
+}
+
+#[tauri::command]
+fn list_running_processes() -> Result<Vec<RunningApp>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use sysinfo::System;
+
+        let mut sys = System::new_all();
+        sys.refresh_processes();
+
+        let mut out: Vec<RunningApp> = sys
+            .processes()
+            .iter()
+            .map(|(pid, proc_)| {
+                let pid_u32: u32 = pid.to_string().parse::<u32>().unwrap_or(0);
+                RunningApp {
+                    pid: pid_u32,
+                    name: proc_.name().to_string(),
+                    path: proc_.exe().map(|p| p.display().to_string()),
+                    title: None,
+                }
+            })
+            .collect();
+
+        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        Ok(out)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("list_running_processes реализована только для macOS".to_string())
+    }
+}
+
+/* TODO remove below */
+#[tauri::command]
+fn get_macos_tunneled_processes(state: SharedState) -> Vec<String> {
+    state.settings.lock().unwrap().macos_tunneled_processes.clone()
+}
+
+#[tauri::command]
+fn set_macos_tunneled_processes(state: SharedState, processes: Vec<String>) -> Result<(), String> {
+    let mut s = state.settings.lock().unwrap();
+    let mut p = processes;
+    p.sort();
+    p.dedup();
+    s.macos_tunneled_processes = p;
+    s.save(&state.settings_path)
+}
+
+#[tauri::command]
+fn set_macos_process_tunnel_enabled(state: SharedState, enabled: bool) -> Result<(), String> {
+    let mut s = state.settings.lock().unwrap();
+    s.macos_process_tunnel_enabled = enabled;
+    s.save(&state.settings_path)
+}
+/* TODO remove upper */
+
+#[cfg(target_os = "macos")]
+fn patch_config_for_macos_process_rules(cfg: &mut Value, settings: &LocalSettings) {
+    if !settings.macos_process_tunnel_enabled {
+        return;
+    }
+
+    let processes = settings
+        .macos_tunneled_processes
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    if processes.is_empty() {
+        return;
+    }
+    let route = cfg.as_object_mut()
+        .and_then(|root| root.get_mut("route"))
+        .and_then(|v| v.as_object_mut());
+    if route.is_none() {
+        // если route отсутствует — создаем
+        if let Some(root) = cfg.as_object_mut() {
+            root.insert("route".to_string(), serde_json::json!({}));
+        }
+    }
+    let route = cfg.get_mut("route").and_then(|v| v.as_object_mut()).unwrap();
+    let rules = route.entry("rules".to_string()).or_insert_with(|| serde_json::json!([]));
+    let rules_arr = rules.as_array_mut().unwrap();
+    let rule = json!({
+        "process_name": processes,
+        "outbound": settings.split_routing.proxy_outbound
+    });
+    rules_arr.insert(0, rule);
 }
 
 #[tauri::command]

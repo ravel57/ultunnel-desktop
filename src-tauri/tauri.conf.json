@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ultunnel-desktop",
   "version": "0.1.0",
-  "identifier": "ru.ravel.ultunnel-desktop",
+  "identifier": "ru.ravel.ultunnel-macos",
   "build": {
     "beforeDevCommand": "yarn build",
     "beforeBuildCommand": "yarn build",

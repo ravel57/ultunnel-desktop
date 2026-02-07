@@ -61,6 +61,10 @@ pub struct LocalSettings {
     #[serde(default)]
     pub socks5_inbound: bool,
 
+    pub macos_process_tunnel_enabled: bool,
+
+    pub macos_tunneled_processes: Vec<String>,
+
 	#[serde(default)]
 	pub autostart_enabled: bool,
 }
@@ -72,6 +76,8 @@ impl Default for LocalSettings {
             selected_config: None,
             split_routing: SplitRoutingSettings::default(),
             socks5_inbound: false,
+            macos_process_tunnel_enabled: false,
+            macos_tunneled_processes: vec![],
 			autostart_enabled: true,
         }
     }
