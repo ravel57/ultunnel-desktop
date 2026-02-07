@@ -29,8 +29,14 @@ use tauri::WindowEvent;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::process::CommandChild;
 use std::process::Command;
-use std::process::Stdio;
 use tauri_plugin_autostart::MacosLauncher;
+use std::thread::sleep;
+use std::time::Duration;
+use std::time::Instant;
+use serde_json::Map;
+use tauri_plugin_autostart::ManagerExt;
+#[cfg(target_os = "macos")]
+use sysinfo::System;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -118,7 +124,6 @@ fn get_profiles(state: State<'_, Arc<AppState>>) -> Vec<String> {
 #[cfg(target_os = "macos")]
 #[tauri::command]
 fn install_helper_if_needed() -> Result<(), String> {
-    use std::path::Path;
     if Path::new(HELPER_DST).exists() {
         return Ok(());
     }
@@ -526,11 +531,6 @@ fn is_singbox_running_windows() -> bool {
 
 #[cfg(target_os = "windows")]
 fn wait_singbox_running_windows(timeout_ms: u64) -> bool {
-    use std::{
-        thread::sleep,
-        time::{Duration, Instant},
-    };
-
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     while Instant::now() < deadline {
         if is_singbox_running_windows() {
@@ -756,8 +756,6 @@ fn apply_split_routing(cfg: &mut serde_json::Value, split: &SplitRoutingSettings
         return;
     }
 
-    use serde_json::{json, Map, Value};
-
     let root = match cfg.as_object_mut() {
         Some(v) => v,
         None => return,
@@ -945,7 +943,6 @@ fn list_running_apps() -> Result<Vec<RunningApp>, String> {
 
     #[cfg(target_os = "macos")]
     {
-        use sysinfo::System;
         let mut sys = System::new_all();
         sys.refresh_processes();
         let mut out: Vec<RunningApp> = sys
@@ -966,8 +963,6 @@ fn list_running_apps() -> Result<Vec<RunningApp>, String> {
 
 #[cfg(target_os = "windows")]
 fn list_running_apps_windows() -> Result<Vec<RunningApp>, String> {
-    use std::process::Command;
-
     // Берём только процессы с окном (MainWindowHandle != 0),
     // чтобы было "как диспетчер задач" (активные приложения), а не сервисы/фон.
     // Path может быть пустой для системных процессов — их отфильтруем.
@@ -1057,8 +1052,6 @@ fn set_socks5_inbound(state: SharedState, enabled: bool) -> Result<(), String> {
 }
 
 fn apply_socks5_inbound(cfg: &mut serde_json::Value, enabled: bool, proxy_outbound: &str) {
-    use serde_json::{json, Map, Value};
-
     let root = match cfg.as_object_mut() {
         Some(v) => v,
         None => return,
@@ -1168,8 +1161,6 @@ fn apply_socks5_inbound(cfg: &mut serde_json::Value, enabled: bool, proxy_outbou
 fn list_running_processes() -> Result<Vec<RunningApp>, String> {
     #[cfg(target_os = "macos")]
     {
-        use sysinfo::System;
-
         let mut sys = System::new_all();
         sys.refresh_processes();
 
@@ -1261,8 +1252,6 @@ fn get_autostart_status(state: SharedState, app: AppHandle) -> Result<Value, Str
 
 	#[cfg(any(target_os = "windows", target_os = "macos"))]
 	{
-		use tauri_plugin_autostart::ManagerExt;
-
 		let enabled = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
 		return Ok(serde_json::json!({
             "desired": desired,
@@ -1283,8 +1272,6 @@ fn get_autostart_status(state: SharedState, app: AppHandle) -> Result<Value, Str
 fn set_autostart_enabled(state: SharedState, app: AppHandle, enabled: bool) -> Result<(), String> {
 	#[cfg(any(target_os = "windows", target_os = "macos"))]
 	{
-		use tauri_plugin_autostart::ManagerExt;
-
 		if enabled {
 			app.autolaunch().enable().map_err(|e| e.to_string())?;
 		} else {
@@ -1300,8 +1287,6 @@ fn set_autostart_enabled(state: SharedState, app: AppHandle, enabled: bool) -> R
 fn sync_autostart_on_startup(app: &AppHandle, state: &Arc<AppState>) {
 	#[cfg(any(target_os = "windows", target_os = "macos"))]
 	{
-		use tauri_plugin_autostart::ManagerExt;
-
 		let desired = state.settings.lock().unwrap().autostart_enabled;
 		let mgr = app.autolaunch();
 
@@ -1313,19 +1298,4 @@ fn sync_autostart_on_startup(app: &AppHandle, state: &Arc<AppState>) {
 			}
 		}
 	}
-}
-
-fn spawn_hidden(exe: &str, args: &[String]) -> Result<std::process::Child, String> {
-	let mut cmd = Command::new(exe);
-	cmd.args(args)
-		.stdin(Stdio::null())
-		.stdout(Stdio::piped()) // или null, если логи не нужны
-		.stderr(Stdio::piped()); // или null
-
-	#[cfg(windows)]
-	{
-		cmd.creation_flags(CREATE_NO_WINDOW);
-	}
-
-	cmd.spawn().map_err(|e| e.to_string())
 }
