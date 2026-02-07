@@ -138,10 +138,11 @@
 							</button>
 						</div>
 						<div class="chips">
-						  <span class="chip" v-for="a in split.proxyApps" :key="a">
+							<span class="chip" v-for="a in split.proxyApps" :key="a">
 							{{ a }} <button class="chipX" @click="removeFrom('proxyApps', a)">×</button>
-						  </span>
+							</span>
 						</div>
+						<div class="sep"></div>
 					</div>
 
 					<!--<div class="splitBlock">-->
@@ -164,10 +165,11 @@
 							<button class="btn" @click="addTo('proxyDomains','newProxyDomain')">Добавить</button>
 						</div>
 						<div class="chips">
-						  <span class="chip" v-for="d in split.proxyDomains" :key="d">
-							{{ d }} <button class="chipX" @click="removeFrom('proxyDomains', d)">×</button>
-						  </span>
+							<span class="chip" v-for="d in split.proxyDomains" :key="d">
+								{{ d }} <button class="chipX" @click="removeFrom('proxyDomains', d)">×</button>
+							</span>
 						</div>
+						<div class="sep"></div>
 					</div>
 
 					<div class="splitBlock">
@@ -238,8 +240,8 @@
 			@click="toggleRun"
 			:title="isRunning ? 'Остановить' : 'Запустить'"
 		>
-			<span v-if="!isRunning">▶</span>
-			<span v-else>■</span>
+			<span class="fabIcon" v-if="!isRunning">▶</span>
+			<span class="fabIcon" v-else>■</span>
 		</button>
 
 		<!-- Bottom nav -->
@@ -631,7 +633,7 @@ export default defineComponent({
 			this.autostartNote = ''
 			this.autostartLoading = true
 			try {
-				await invoke<void>('set_autostart_enabled', { enabled: this.autostartEnabled })
+				await invoke<void>('set_autostart_enabled', {enabled: this.autostartEnabled})
 				await this.loadAutostart()
 			} catch (e: any) {
 				this.autostartNote = String(e)
@@ -867,11 +869,22 @@ export default defineComponent({
 	font-size: 22px;
 	box-shadow: 0 10px 24px rgba(0, 0, 0, .35);
 	cursor: pointer;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 0;
+	line-height: 1;
 }
 
 .fab.on {
 	background: #b48cff;
 	color: #111;
+}
+
+.fab > span {
+	display: inline-block;
+	line-height: 1;
+	transform: translateY(-1px);
 }
 
 /* Bottom nav */
@@ -1076,4 +1089,10 @@ export default defineComponent({
 	border-top: 1px solid rgba(255, 255, 255, .08);
 }
 
+.sep{
+	height: 1px;
+	background: rgba(255,255,255,.08);
+	margin-top: 14px;      /* линия “после кнопки/поля” */
+	margin-bottom: 14px;   /* отступ до следующего блока */
+}
 </style>

@@ -29,11 +29,18 @@ use tauri::WindowEvent;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::process::CommandChild;
 use std::process::Command;
+use std::process::Stdio;
 use tauri_plugin_autostart::MacosLauncher;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 #[cfg(target_os = "macos")]
 const HELPER_LABEL: &str = "ru.ravel.ultunnel-macos.helper";
 #[cfg(target_os = "macos")]
 const HELPER_DST: &str = "/Library/PrivilegedHelperTools/ru.ravel.ultunnel-macos.helper";
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 static EXITING: AtomicBool = AtomicBool::new(false);
 
@@ -414,8 +421,6 @@ pub fn run() {
             get_state,
             get_profiles,
             load_configs,
-            // singbox_start_root,
-            // singbox_stop_root,
             singbox_start_platform,
             singbox_stop_platform,
             open_logs,
@@ -424,6 +429,7 @@ pub fn run() {
             list_running_apps,
             get_socks5_inbound,
             set_socks5_inbound,
+			#[cfg(target_os = "macos")]
             install_helper_if_needed,
             list_running_processes,
             get_macos_tunneled_processes,
@@ -504,12 +510,10 @@ fn stop_singbox_before_exit(app: &tauri::AppHandle) {
 
 #[cfg(target_os = "windows")]
 fn is_singbox_running_windows() -> bool {
-    use std::process::Command;
-
-    let out = Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq sing-box.exe"])
-        .output();
-
+	let mut cmd = Command::new("tasklist");
+	cmd.creation_flags(CREATE_NO_WINDOW)
+		.args(["/FI", "IMAGENAME eq sing-box.exe"]);
+	let out = cmd.output();
     match out {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
@@ -975,10 +979,12 @@ Get-Process |
   ConvertTo-Json -Depth 3
 "#;
 
-    let out = Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
-        .output()
-        .map_err(|e| e.to_string())?;
+	let mut cmd = Command::new("powershell");
+	cmd.creation_flags(CREATE_NO_WINDOW);
+	let out = cmd
+		.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
+		.output()
+		.map_err(|e| e.to_string())?;
 
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).to_string());
@@ -1307,4 +1313,19 @@ fn sync_autostart_on_startup(app: &AppHandle, state: &Arc<AppState>) {
 			}
 		}
 	}
+}
+
+fn spawn_hidden(exe: &str, args: &[String]) -> Result<std::process::Child, String> {
+	let mut cmd = Command::new(exe);
+	cmd.args(args)
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped()) // или null, если логи не нужны
+		.stderr(Stdio::piped()); // или null
+
+	#[cfg(windows)]
+	{
+		cmd.creation_flags(CREATE_NO_WINDOW);
+	}
+
+	cmd.spawn().map_err(|e| e.to_string())
 }
