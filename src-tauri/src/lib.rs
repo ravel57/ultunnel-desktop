@@ -39,6 +39,8 @@ use tauri_plugin_autostart::ManagerExt;
 use sysinfo::System;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(target_os = "macos")]
+use libc;
 
 #[cfg(target_os = "macos")]
 const HELPER_LABEL: &str = "ru.ravel.ultunnel-macos.helper";
@@ -1250,27 +1252,39 @@ fn patch_config_for_macos_process_rules(cfg: &mut Value, settings: &LocalSetting
 fn get_autostart_status(state: SharedState, app: AppHandle) -> Result<Value, String> {
 	let desired = state.settings.lock().unwrap().autostart_enabled;
 
-	#[cfg(any(target_os = "windows", target_os = "macos"))]
+	#[cfg(target_os = "windows")]
 	{
 		let enabled = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
 		return Ok(serde_json::json!({
-            "desired": desired,
-            "enabled": enabled
-        }));
+			"desired": desired,
+			"enabled": enabled
+		}));
+	}
+
+	#[cfg(target_os = "macos")]
+	{
+		let desired = state.settings.lock().unwrap().autostart_enabled;
+		let home = std::env::var("HOME").unwrap_or_default();
+		let plist = Path::new(&home).join("Library/LaunchAgents/ru.ravel.ultunnel.plist");
+		let enabled = plist.exists();
+        return Ok(json!({
+		    "desired": desired,
+		    "enabled": enabled
+	    }));
 	}
 
 	#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 	{
 		Ok(serde_json::json!({
-            "desired": desired,
-            "enabled": false
-        }))
+			"desired": desired,
+			"enabled": false
+		}))
 	}
 }
 
 #[tauri::command]
 fn set_autostart_enabled(state: SharedState, app: AppHandle, enabled: bool) -> Result<(), String> {
-	#[cfg(any(target_os = "windows", target_os = "macos"))]
+	#[cfg(target_os = "windows")]
 	{
 		if enabled {
 			app.autolaunch().enable().map_err(|e| e.to_string())?;
@@ -1279,13 +1293,21 @@ fn set_autostart_enabled(state: SharedState, app: AppHandle, enabled: bool) -> R
 		}
 	}
 
+	#[cfg(target_os = "macos")]
+	{
+		install_helper_if_needed()?;
+		let app_bundle = macos_find_app_bundle()?;
+		let uid = macos_get_uid();
+		macos_smjobbless::helper_set_autostart(HELPER_LABEL, enabled, &app_bundle, uid)?;
+	}
+
 	let mut s = state.settings.lock().unwrap();
 	s.autostart_enabled = enabled;
 	s.save(&state.settings_path)
 }
 
 fn sync_autostart_on_startup(app: &AppHandle, state: &Arc<AppState>) {
-	#[cfg(any(target_os = "windows", target_os = "macos"))]
+	#[cfg(target_os = "windows")]
 	{
 		let desired = state.settings.lock().unwrap().autostart_enabled;
 		let mgr = app.autolaunch();
@@ -1298,4 +1320,36 @@ fn sync_autostart_on_startup(app: &AppHandle, state: &Arc<AppState>) {
 			}
 		}
 	}
+
+	#[cfg(target_os = "macos")]
+	{
+		let desired = state.settings.lock().unwrap().autostart_enabled;
+		if install_helper_if_needed().is_ok() {
+			if let Ok(app_bundle) = macos_find_app_bundle() {
+				let uid = macos_get_uid();
+				let _ = macos_smjobbless::helper_set_autostart(HELPER_LABEL, desired, &app_bundle, uid);
+			}
+		}
+	}
+}
+
+#[cfg(target_os = "macos")]
+fn macos_find_app_bundle() -> Result<PathBuf, String> {
+	let mut p = std::env::current_exe().map_err(|e| e.to_string())?;
+	loop {
+		if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+			if name.ends_with(".app") {
+				return Ok(p);
+			}
+		}
+		if !p.pop() {
+			break;
+		}
+	}
+	Err("Не удалось определить путь к .app из current_exe()".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_get_uid() -> i32 {
+	unsafe { libc::getuid() as i32 }
 }

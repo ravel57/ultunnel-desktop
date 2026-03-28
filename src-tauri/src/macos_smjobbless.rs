@@ -15,6 +15,14 @@ extern "C" {
 	fn smhelper_stop_singbox(label: *const i8, error_out: *mut *mut i8) -> i32;
 
 	fn smhelper_free(p: *mut core::ffi::c_void);
+
+	fn smhelper_set_autostart(
+		label: *const i8,
+		enabled: i32,
+		app_path: *const i8,
+		uid: i32,
+		error_out: *mut *mut i8,
+	) -> i32;
 }
 
 fn take_err(ptr: *mut i8) -> Option<String> {
@@ -75,5 +83,27 @@ pub fn helper_stop_singbox(label: &str) -> Result<(), String> {
 		Ok(())
 	} else {
 		Err(take_err(err).unwrap_or_else(|| "helper stopSingBox failed (no error)".to_string()))
+	}
+}
+
+pub fn helper_set_autostart(label: &str, enabled: bool, app_path: &Path, uid: i32) -> Result<(), String> {
+	let c_label = CString::new(label).map_err(|e| e.to_string())?;
+	let c_app = CString::new(app_path.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
+
+	let mut err: *mut i8 = core::ptr::null_mut();
+	let ok = unsafe {
+		smhelper_set_autostart(
+			c_label.as_ptr(),
+			if enabled { 1 } else { 0 },
+			c_app.as_ptr(),
+			uid,
+			&mut err,
+		)
+	} != 0;
+
+	if ok {
+		Ok(())
+	} else {
+		Err(take_err(err).unwrap_or_else(|| "helper setAutostart failed (no error)".to_string()))
 	}
 }

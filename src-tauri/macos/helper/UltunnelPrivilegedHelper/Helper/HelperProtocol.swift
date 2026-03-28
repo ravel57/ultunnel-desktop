@@ -23,4 +23,14 @@ protocol UltunnelPrivilegedHelperProtocol: NSObjectProtocol {
     // selector: statusWithReply:
     @objc(statusWithReply:)
     func statusWithReply(_ reply: @escaping (Bool, Int32) -> Void)
+
+    // selector: setAutostart:appPath:uid:reply:
+    @objc(setAutostart:appPath:uid:reply:)
+    func setAutostart(
+    _ enabled: Bool,
+    appPath: String,
+    uid: Int32,
+    reply: @escaping (Int32, String) -> Void
+    )
+
 }

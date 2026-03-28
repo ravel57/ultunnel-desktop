@@ -94,6 +94,11 @@ int smjobbless_install(const char *label_c, char **error_out) {
 - (void)stopSingBoxWithReply:(void (^)(int32_t code, NSString *msg))reply;
 
 - (void)statusWithReply:(void (^)(BOOL running, int32_t pid))reply;
+
+- (void)setAutostart:(BOOL)enabled
+             appPath:(NSString *)appPath
+                 uid:(int32_t)uid
+               reply:(void (^)(int32_t code, NSString *msg))reply;
 @end
 
 
@@ -277,5 +282,35 @@ int smhelper_status(const char *label_c, int *running_out, int *code_out, char *
       return 1;
     }
     return 0;
+  }
+}
+
+int smhelper_set_autostart(const char *label_c,
+                           int enabled,
+                           const char *app_path_c,
+                           int32_t uid,
+                           char **error_out) {
+  @autoreleasepool {
+    NSString *label = toNSString(label_c);
+    NSString *appPath = toNSString(app_path_c);
+
+    if (!label.length) {
+      if (error_out) *error_out = dupCString(@"Empty helper label");
+      return 0;
+    }
+    if (!appPath.length) {
+      if (error_out) *error_out = dupCString(@"Empty appPath");
+      return 0;
+    }
+
+    return call_helper(label, ^(id<UltunnelPrivilegedHelperProtocol> remote, void (^done)(BOOL ok, NSString *err)) {
+      [remote setAutostart:(enabled ? YES : NO)
+                  appPath:appPath
+                      uid:uid
+                    reply:^(int32_t code, NSString *msg) {
+        BOOL success = (code == 0);
+        done(success, msg ?: @"");
+      }];
+    }, error_out);
   }
 }

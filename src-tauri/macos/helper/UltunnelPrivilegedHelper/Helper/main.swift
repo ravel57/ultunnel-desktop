@@ -191,6 +191,58 @@ private func decodeArgsJson(_ s: String) -> [String] {
     }
 }
 
+// MARK: - Autostart utils
+
+private func runCapture(_ path: String, _ args: [String]) throws -> (Int32, String) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+
+    let out = Pipe()
+    let err = Pipe()
+    p.standardOutput = out
+    p.standardError = err
+
+    try p.run()
+    p.waitUntilExit()
+
+    let outStr = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let errStr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return (p.terminationStatus, (outStr + errStr).trimmingCharacters(in: .whitespacesAndNewlines))
+}
+
+private func plistXml(label: String, appExecPath: String) -> String {
+    """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+      <key>Label</key>
+      <string>\(label)</string>
+
+      <key>ProgramArguments</key>
+      <array>
+        <string>\(appExecPath)</string>
+      </array>
+
+      <key>RunAtLoad</key>
+      <true/>
+
+      <key>KeepAlive</key>
+      <false/>
+
+      <key>ProcessType</key>
+      <string>Interactive</string>
+
+      <key>StandardOutPath</key>
+      <string>/tmp/\(label).out.log</string>
+      <key>StandardErrorPath</key>
+      <string>/tmp/\(label).err.log</string>
+    </dict>
+    </plist>
+    """
+}
+
 // MARK: - XPC Helper
 
 final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
@@ -228,6 +280,54 @@ final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
         let (running, pid) = runner.isRunning()
         reply(running, pid)
     }
+
+    @objc(setAutostart:appPath:uid:reply:)
+    func setAutostart(_ enabled: Bool, appPath: String, uid: Int32, reply: @escaping (Int32, String) -> Void) {
+        let label = "ru.ravel.ultunnel" // LaunchAgent label (НЕ label helper)
+
+        do {
+            // HOME пользователя по uid (правильно)
+            guard let pw = getpwuid(uid_t(uid)), let dirC = pw.pointee.pw_dir else {
+                reply(1, "getpwuid failed for uid=\(uid)")
+                return
+            }
+            let homePath = String(cString: dirC)
+
+            let launchAgentsDir = "\(homePath)/Library/LaunchAgents"
+            let plistPath = "\(launchAgentsDir)/\(label).plist"
+
+            try FileManager.default.createDirectory(atPath: launchAgentsDir, withIntermediateDirectories: true)
+
+            // Проверьте имя бинаря внутри .app (может отличаться!)
+            let appExec = "\(appPath)/Contents/MacOS/ultunnel-desktop"
+
+            if enabled {
+                let xml = plistXml(label: label, appExecPath: appExec)
+                try xml.write(toFile: plistPath, atomically: true, encoding: .utf8)
+
+                _ = try? runCapture("/usr/sbin/chown", ["\(uid):staff", plistPath])
+                _ = try? runCapture("/bin/chmod", ["644", plistPath])
+
+                _ = try? runCapture("/bin/launchctl", ["asuser", "\(uid)", "/bin/launchctl", "bootout", "gui/\(uid)", plistPath])
+
+                let (stB, outB) = try runCapture("/bin/launchctl", ["asuser", "\(uid)", "/bin/launchctl", "bootstrap", "gui/\(uid)", plistPath])
+                if stB != 0 {
+                    reply(3, "bootstrap failed: \(outB)")
+                    return
+                }
+
+                _ = try? runCapture("/bin/launchctl", ["asuser", "\(uid)", "/bin/launchctl", "kickstart", "-k", "gui/\(uid)/\(label)"])
+                reply(0, "autostart enabled")
+            } else {
+                _ = try? runCapture("/bin/launchctl", ["asuser", "\(uid)", "/bin/launchctl", "bootout", "gui/\(uid)", plistPath])
+                try? FileManager.default.removeItem(atPath: plistPath)
+                reply(0, "autostart disabled")
+            }
+        } catch {
+            reply(10, "exception: \(error)")
+        }
+    }
+
 }
 
 // MARK: - NSXPCListener

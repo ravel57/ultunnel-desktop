@@ -4788,6 +4788,7 @@ name = "ultunnel-desktop"
 version = "0.2.0"
 dependencies = [
  "cc",
+ "libc",
  "reqwest",
  "runas",
  "serde",
