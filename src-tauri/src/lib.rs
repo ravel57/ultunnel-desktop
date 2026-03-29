@@ -153,6 +153,40 @@ fn install_privileged_helper() -> Result<(), String> {
     }
 }
 
+fn normalize_primary_outbound_tag(cfg: &mut Value) {
+    let root = match cfg.as_object_mut() {
+        Some(v) => v,
+        None => return,
+    };
+
+    let outbounds = match root.get_mut("outbounds").and_then(|v| v.as_array_mut()) {
+        Some(v) => v,
+        None => return,
+    };
+
+    if outbounds.is_empty() {
+        return;
+    }
+
+    let first = match outbounds.get_mut(0).and_then(|v| v.as_object_mut()) {
+        Some(v) => v,
+        None => return,
+    };
+
+    let current_tag = first.get("tag").and_then(|v| v.as_str()).unwrap_or("");
+
+    if current_tag != "proxy" {
+        first.insert("tag".to_string(), Value::String("proxy".to_string()));
+    }
+
+    let outbound_type = first.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if outbound_type == "wireguard" {
+        if first.get("server_port").is_none() {
+            first.insert("server_port".to_string(), Value::Number(51820.into()));
+        }
+    }
+}
+
 fn write_singbox_config(
     app: &AppHandle,
     cfg: &Value,
@@ -164,6 +198,8 @@ fn write_singbox_config(
     let path: PathBuf = dir.join("singbox.json");
 
     let mut v = cfg.clone();
+
+    normalize_primary_outbound_tag(&mut v);
 
     #[cfg(target_os = "macos")]
     {
@@ -191,9 +227,9 @@ fn write_singbox_config(
 
 #[cfg(target_os = "windows")]
 fn patch_config_for_windows(cfg: &mut serde_json::Value, split: &SplitRoutingSettings) {
-    if !split.enabled {
+/*    if !split.enabled {
         return;
-    }
+    }*/
 
     // 1) Для корректного определения процесса на Windows нужен stack=system
     if let Some(inbounds) = cfg.get_mut("inbounds").and_then(|v| v.as_array_mut()) {
@@ -216,6 +252,17 @@ fn patch_config_for_windows(cfg: &mut serde_json::Value, split: &SplitRoutingSet
             route_obj
                 .entry("auto_detect_interface".to_string())
                 .or_insert(serde_json::Value::Bool(true));
+        }
+    }
+
+    if split.enabled {
+        if let Some(root) = cfg.as_object_mut() {
+            let route = root.entry("route").or_insert_with(|| serde_json::json!({}));
+            if let Some(route_obj) = route.as_object_mut() {
+                route_obj
+                    .entry("find_process".to_string())
+                    .or_insert(serde_json::Value::Bool(true));
+            }
         }
     }
 }
@@ -775,7 +822,7 @@ fn apply_split_routing(cfg: &mut serde_json::Value, split: &SplitRoutingSettings
     // === КЛЮЧЕВОЕ: split = default DIRECT, а VPN только по правилам ===
     route.insert(
         "final".to_string(),
-        Value::String(split.direct_outbound.clone()),
+        Value::String(split.proxy_outbound.clone()),
     );
 
     // process_* правила требуют find_process=true
@@ -834,7 +881,7 @@ fn apply_split_routing(cfg: &mut serde_json::Value, split: &SplitRoutingSettings
             None => return true,
         };
 
-        // не трогаем action-правила
+/*        // не трогаем action-правила
         if o.contains_key("action") {
             return true;
         }
@@ -861,7 +908,7 @@ fn apply_split_routing(cfg: &mut serde_json::Value, split: &SplitRoutingSettings
         let o = match r.as_object() {
             Some(x) => x,
             None => return true,
-        };
+        };*/
         if o.contains_key("action") {
             return true;
         }
@@ -879,10 +926,11 @@ fn apply_split_routing(cfg: &mut serde_json::Value, split: &SplitRoutingSettings
             return true;
         }
 
-        let is_split = o.contains_key("process_name")
+        let is_split_rule = o.contains_key("process_name")
             || o.contains_key("process_path")
             || o.contains_key("domain_suffix");
-        !is_split // split-правила удаляем
+
+        !is_split_rule
     });
 
     // 3) Генерим актуальные выборочные правила
@@ -891,11 +939,20 @@ fn apply_split_routing(cfg: &mut serde_json::Value, split: &SplitRoutingSettings
     // bypass (apps/domains -> direct)
     let (bypass_names, bypass_paths) = split_process_tokens(&split.bypass_apps);
     if !bypass_paths.is_empty() {
-        new_rules.push(json!({ "inbound":["tun-in"], "process_path": bypass_paths, "outbound": split.direct_outbound }));
+        new_rules.push(json!({
+            "inbound": ["tun-in"],
+            "process_path": bypass_paths,
+            "outbound": split.direct_outbound
+        }));
     }
     if !bypass_names.is_empty() {
-        new_rules.push(json!({ "inbound":["tun-in"], "process_name": bypass_names, "outbound": split.direct_outbound }));
+        new_rules.push(json!({
+            "inbound": ["tun-in"],
+            "process_name": bypass_names,
+            "outbound": split.direct_outbound
+        }));
     }
+
     let bypass_domains: Vec<String> = split
         .bypass_domains
         .iter()
@@ -903,17 +960,30 @@ fn apply_split_routing(cfg: &mut serde_json::Value, split: &SplitRoutingSettings
         .filter(|s| !s.is_empty())
         .collect();
     if !bypass_domains.is_empty() {
-        new_rules.push(json!({ "inbound":["tun-in"], "domain_suffix": bypass_domains, "outbound": split.direct_outbound }));
+        new_rules.push(json!({
+            "inbound": ["tun-in"],
+            "domain_suffix": bypass_domains,
+            "outbound": split.direct_outbound
+        }));
     }
 
     // proxy (apps/domains -> proxy)
     let (proxy_names, proxy_paths) = split_process_tokens(&split.proxy_apps);
     if !proxy_paths.is_empty() {
-        new_rules.push(json!({ "inbound":["tun-in"], "process_path": proxy_paths, "outbound": split.proxy_outbound }));
+        new_rules.push(json!({
+            "inbound": ["tun-in"],
+            "process_path": proxy_paths,
+            "outbound": split.proxy_outbound
+        }));
     }
     if !proxy_names.is_empty() {
-        new_rules.push(json!({ "inbound":["tun-in"], "process_name": proxy_names, "outbound": split.proxy_outbound }));
+        new_rules.push(json!({
+            "inbound": ["tun-in"],
+            "process_name": proxy_names,
+            "outbound": split.proxy_outbound
+        }));
     }
+
     let proxy_domains: Vec<String> = split
         .proxy_domains
         .iter()
@@ -921,7 +991,11 @@ fn apply_split_routing(cfg: &mut serde_json::Value, split: &SplitRoutingSettings
         .filter(|s| !s.is_empty())
         .collect();
     if !proxy_domains.is_empty() {
-        new_rules.push(json!({ "inbound":["tun-in"], "domain_suffix": proxy_domains, "outbound": split.proxy_outbound }));
+        new_rules.push(json!({
+            "inbound": ["tun-in"],
+            "domain_suffix": proxy_domains,
+            "outbound": split.proxy_outbound
+        }));
     }
 
     // 4) Вставляем после sniff/hijack-dns
