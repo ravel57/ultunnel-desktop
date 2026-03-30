@@ -12,16 +12,36 @@ pub async fn fetch_raw_configs(secret_key: &str) -> Result<Value, String> {
         "https://admin.ultunnel.ru/api/v1/get-users-proxy-servers-singbox",
         &[("secretKey", secret_key), ("platform", "desktop")],
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format!("url parse error: {e}"))?;
 
     let client = reqwest::Client::new();
-    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+
+    tracing::info!("Запрос конфигов: {}", url);
+
+    let resp = client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|e| {
+            let msg = format!("request error for {url}: {e:?}");
+            tracing::error!("{}", msg);
+            msg
+        })?;
 
     if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
+        let msg = format!("HTTP {} for {}", resp.status(), url);
+        tracing::error!("{}", msg);
+        return Err(msg);
     }
 
-    resp.json::<Value>().await.map_err(|e| e.to_string())
+    let json = resp.json::<Value>().await.map_err(|e| {
+        let msg = format!("json parse error for {url}: {e:?}");
+        tracing::error!("{}", msg);
+        msg
+    })?;
+
+    tracing::info!("Конфиги от API успешно получены");
+    Ok(json)
 }
 
 fn parse_config_value(v: &Value) -> Option<Value> {

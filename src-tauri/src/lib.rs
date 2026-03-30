@@ -8,17 +8,28 @@ use crate::settings::SplitRoutingSettings;
 use api::fetch_raw_configs;
 use api::normalize_configs;
 use api::ProxyConfig;
+#[cfg(target_os = "macos")]
+use libc;
 use serde::Serialize;
 use serde_json::json;
+use serde_json::Map;
 use serde_json::Value;
 use std::fs;
 use std::fs::OpenOptions;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::thread::sleep;
+use std::time::Duration;
+use std::time::Instant;
+#[cfg(target_os = "macos")]
+use sysinfo::System;
 use tauri::menu::Menu;
 use tauri::menu::MenuItem;
 use tauri::tray::TrayIconBuilder;
@@ -26,21 +37,14 @@ use tauri::AppHandle;
 use tauri::Manager;
 use tauri::State;
 use tauri::WindowEvent;
+use tauri_plugin_autostart::MacosLauncher;
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::process::CommandChild;
-use std::process::Command;
-use tauri_plugin_autostart::MacosLauncher;
-use std::thread::sleep;
-use std::time::Duration;
-use std::time::Instant;
-use serde_json::Map;
-use tauri_plugin_autostart::ManagerExt;
-#[cfg(target_os = "macos")]
-use sysinfo::System;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(target_os = "macos")]
-use libc;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
+use tracing_appender::non_blocking::WorkerGuard;
 
 #[cfg(target_os = "macos")]
 const HELPER_LABEL: &str = "ru.ravel.ultunnel-macos.helper";
@@ -59,6 +63,7 @@ pub struct AppState {
     pub configs: Mutex<Vec<ProxyConfig>>,
     pub running: AtomicBool,
     pub singbox: Mutex<Option<CommandChild>>,
+    pub log_guard: Mutex<Option<WorkerGuard>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,6 +76,32 @@ pub struct RunningApp {
 }
 
 type SharedState<'a> = State<'a, Arc<AppState>>;
+
+fn init_file_logger(app: &AppHandle) -> Result<WorkerGuard, String> {
+    let log_path = app_log_path(app)?;
+    let log_dir = log_path
+        .parent()
+        .ok_or("Не удалось определить папку логов".to_string())?;
+
+    fs::create_dir_all(log_dir).map_err(|e| e.to_string())?;
+
+    let file_appender = tracing_appender::rolling::never(log_dir, "app.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
+        .finish();
+
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|e| e.to_string())?;
+
+    Ok(guard)
+}
 
 #[tauri::command]
 fn get_access_key(state: SharedState) -> String {
@@ -227,7 +258,7 @@ fn write_singbox_config(
 
 #[cfg(target_os = "windows")]
 fn patch_config_for_windows(cfg: &mut serde_json::Value, split: &SplitRoutingSettings) {
-/*    if !split.enabled {
+    /*    if !split.enabled {
         return;
     }*/
 
@@ -268,7 +299,10 @@ fn patch_config_for_windows(cfg: &mut serde_json::Value, split: &SplitRoutingSet
 }
 
 // #[tauri::command]
-pub async fn singbox_start_root(config_path: String, args: Option<Vec<String>>) -> Result<(), String> {
+pub async fn singbox_start_root(
+    config_path: String,
+    args: Option<Vec<String>>,
+) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         install_privileged_helper().map_err(|e| e.to_string())?;
@@ -313,9 +347,7 @@ async fn singbox_stop_root(app: AppHandle) -> Result<(), String> {
         let _ = Command::new("/usr/bin/pkill")
             .args(["-x", "sing-box"])
             .status();
-        let _ = Command::new("/usr/bin/killall")
-            .args(["sing-box"])
-            .status();
+        let _ = Command::new("/usr/bin/killall").args(["sing-box"]).status();
         let _ = Command::new("/usr/bin/pkill")
             .args(["-f", "sing-box"])
             .status();
@@ -378,20 +410,47 @@ async fn load_configs(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, St
         s.access_key.clone()
     };
     if access_key.is_empty() {
+        warn!("Попытка загрузить конфиги без access_key");
         return Err("accessKey не задан".into());
     }
-    let raw = fetch_raw_configs(&access_key).await?;
-    let configs = normalize_configs(raw)?;
+
+    info!("Начата загрузка конфигов");
+
+    let raw = match fetch_raw_configs(&access_key).await {
+        Ok(v) => {
+            info!("Сырые конфиги успешно загружены");
+            v
+        }
+        Err(e) => {
+            error!("Ошибка загрузки конфигов: {}", e);
+            return Err(e);
+        }
+    };
+
+    let configs = match normalize_configs(raw) {
+        Ok(v) => {
+            info!("Конфиги успешно нормализованы, count={}", v.len());
+            v
+        }
+        Err(e) => {
+            error!("Ошибка нормализации конфигов: {}", e);
+            return Err(e);
+        }
+    };
+
     {
         let mut stored = state.configs.lock().unwrap();
         *stored = configs.clone();
     }
 
-    // ⚠ сохранить конфиги в файле рядом с config.json
-    save_configs_to_file(&state.configs_path, &configs)?;
+    save_configs_to_file(&state.configs_path, &configs)
+        .map_err(|e| {
+            error!("Ошибка сохранения configs.json: {}", e);
+            e
+        })?;
 
-    // фронту можно отдать только имена профилей
     let names = configs.into_iter().map(|c| c.name).collect();
+    info!("Список конфигов обновлён");
     Ok(names)
 }
 
@@ -405,12 +464,12 @@ pub fn run() {
     {
         builder = builder.plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
-            None
+            None,
         ));
     }
 
     let app = builder
-		.setup(|app| {
+        .setup(|app| {
             let show = MenuItem::with_id(app, "show", "Показать/Скрыть", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
@@ -456,7 +515,16 @@ pub fn run() {
                 configs: Mutex::new(configs),
                 running: AtomicBool::new(false),
                 singbox: Mutex::new(None),
+                log_guard: Mutex::new(None),
             });
+
+            if let Ok(guard) = init_file_logger(&handle) {
+                *state.log_guard.lock().unwrap() = Some(guard);
+                info!("Логгер инициализирован");
+            } else {
+                eprintln!("Не удалось инициализировать app.log");
+            }
+
             app.manage(state.clone());
             sync_autostart_on_startup(&handle, &state);
             Ok(())
@@ -483,7 +551,7 @@ pub fn run() {
             list_running_apps,
             get_socks5_inbound,
             set_socks5_inbound,
-			#[cfg(target_os = "macos")]
+            #[cfg(target_os = "macos")]
             install_helper_if_needed,
             list_running_processes,
             get_macos_tunneled_processes,
@@ -564,10 +632,10 @@ fn stop_singbox_before_exit(app: &tauri::AppHandle) {
 
 #[cfg(target_os = "windows")]
 fn is_singbox_running_windows() -> bool {
-	let mut cmd = Command::new("tasklist");
-	cmd.creation_flags(CREATE_NO_WINDOW)
-		.args(["/FI", "IMAGENAME eq sing-box.exe"]);
-	let out = cmd.output();
+    let mut cmd = Command::new("tasklist");
+    cmd.creation_flags(CREATE_NO_WINDOW)
+        .args(["/FI", "IMAGENAME eq sing-box.exe"]);
+    let out = cmd.output();
     match out {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
@@ -675,7 +743,7 @@ async fn singbox_start_platform(app: AppHandle, state: SharedState<'_>) -> Resul
 
     #[cfg(target_os = "macos")]
     {
-        let r = singbox_start_root(/*app,*/cfg_path_str, None).await;
+        let r = singbox_start_root(/*app,*/ cfg_path_str, None).await;
         if r.is_ok() {
             state.running.store(true, Ordering::Relaxed);
         }
@@ -810,143 +878,44 @@ fn apply_split_routing(cfg: &mut serde_json::Value, split: &SplitRoutingSettings
         None => return,
     };
 
-    // route object
     if !root.contains_key("route") || !root.get("route").unwrap().is_object() {
         root.insert("route".into(), Value::Object(Map::new()));
     }
+
     let route = root
         .get_mut("route")
         .and_then(|v| v.as_object_mut())
         .unwrap();
 
-    // === КЛЮЧЕВОЕ: split = default DIRECT, а VPN только по правилам ===
     route.insert(
         "final".to_string(),
-        Value::String(split.proxy_outbound.clone()),
+        Value::String(split.direct_outbound.clone()),
     );
 
-    // process_* правила требуют find_process=true
+    route.insert("auto_detect_interface".to_string(), Value::Bool(true));
+
     let has_process_rules = split.bypass_apps.iter().any(|s| !s.trim().is_empty())
         || split.proxy_apps.iter().any(|s| !s.trim().is_empty());
+
     if has_process_rules {
-        route
-            .entry("find_process".to_string())
-            .or_insert(Value::Bool(true));
+        route.insert("find_process".to_string(), Value::Bool(true));
     }
 
-    // rules array
-    if !route.contains_key("rules") || !route.get("rules").unwrap().is_array() {
-        route.insert("rules".into(), Value::Array(vec![]));
-    }
-    let rules = route
-        .get_mut("rules")
-        .and_then(|v| v.as_array_mut())
-        .unwrap();
+    let mut rules: Vec<Value> = vec![
+        json!({ "inbound": ["tun-in"], "action": "sniff" }),
+        json!({ "protocol": ["dns"], "action": "hijack-dns" }),
+    ];
 
-    let is_action = |r: &Value, a: &str| -> bool {
-        r.as_object()
-            .and_then(|o| o.get("action"))
-            .and_then(|v| v.as_str())
-            == Some(a)
-    };
-
-    let inbound_is_tun = |r: &Value| -> bool {
-        let o = match r.as_object() {
-            Some(x) => x,
-            None => return false,
-        };
-        match o.get("inbound").and_then(|v| v.as_array()) {
-            Some(a) => a.len() == 1 && a[0].as_str() == Some("tun-in"),
-            None => false,
-        }
-    };
-
-    // 0) Гарантируем sniff + hijack-dns (для доменных правил)
-    if !rules.iter().any(|r| is_action(r, "sniff")) {
-        rules.insert(0, json!({ "inbound": ["tun-in"], "action": "sniff" }));
-    }
-    if !rules.iter().any(|r| is_action(r, "hijack-dns")) {
-        let idx = rules
-            .iter()
-            .position(|r| is_action(r, "sniff"))
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        rules.insert(idx, json!({ "protocol": ["dns"], "action": "hijack-dns" }));
-    }
-
-    // 1) Удаляем безусловный catch-all tun-in -> proxy (он и делает “всё в VPN”)
-    rules.retain(|r| {
-        let o = match r.as_object() {
-            Some(x) => x,
-            None => return true,
-        };
-
-/*        // не трогаем action-правила
-        if o.contains_key("action") {
-            return true;
-        }
-
-        // удаляем только "чистый" catch-all:
-        // { inbound:["tun-in"], outbound:"proxy_outbound" } без доп условий
-        let outbound = o.get("outbound").and_then(|v| v.as_str());
-        if inbound_is_tun(r) && outbound == Some(split.proxy_outbound.as_str()) {
-            let has_any_condition = o.contains_key("process_name")
-                || o.contains_key("process_path")
-                || o.contains_key("domain_suffix")
-                || o.contains_key("ip_cidr")
-                || o.contains_key("port")
-                || o.contains_key("network")
-                || o.contains_key("protocol");
-            return has_any_condition; // если есть условия — оставляем, иначе удаляем
-        }
-
-        true
-    });
-
-    // 2) Удаляем ранее сгенерированные split-правила (чтобы не копились и не конфликтовали)
-    rules.retain(|r| {
-        let o = match r.as_object() {
-            Some(x) => x,
-            None => return true,
-        };*/
-        if o.contains_key("action") {
-            return true;
-        }
-
-        if !inbound_is_tun(r) {
-            return true;
-        }
-
-        let outbound = match o.get("outbound").and_then(|v| v.as_str()) {
-            Some(x) => x,
-            None => return true,
-        };
-
-        if outbound != split.direct_outbound && outbound != split.proxy_outbound {
-            return true;
-        }
-
-        let is_split_rule = o.contains_key("process_name")
-            || o.contains_key("process_path")
-            || o.contains_key("domain_suffix");
-
-        !is_split_rule
-    });
-
-    // 3) Генерим актуальные выборочные правила
-    let mut new_rules: Vec<Value> = Vec::new();
-
-    // bypass (apps/domains -> direct)
     let (bypass_names, bypass_paths) = split_process_tokens(&split.bypass_apps);
     if !bypass_paths.is_empty() {
-        new_rules.push(json!({
+        rules.push(json!({
             "inbound": ["tun-in"],
             "process_path": bypass_paths,
             "outbound": split.direct_outbound
         }));
     }
     if !bypass_names.is_empty() {
-        new_rules.push(json!({
+        rules.push(json!({
             "inbound": ["tun-in"],
             "process_name": bypass_names,
             "outbound": split.direct_outbound
@@ -959,25 +928,25 @@ fn apply_split_routing(cfg: &mut serde_json::Value, split: &SplitRoutingSettings
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+
     if !bypass_domains.is_empty() {
-        new_rules.push(json!({
+        rules.push(json!({
             "inbound": ["tun-in"],
             "domain_suffix": bypass_domains,
             "outbound": split.direct_outbound
         }));
     }
 
-    // proxy (apps/domains -> proxy)
     let (proxy_names, proxy_paths) = split_process_tokens(&split.proxy_apps);
     if !proxy_paths.is_empty() {
-        new_rules.push(json!({
+        rules.push(json!({
             "inbound": ["tun-in"],
             "process_path": proxy_paths,
             "outbound": split.proxy_outbound
         }));
     }
     if !proxy_names.is_empty() {
-        new_rules.push(json!({
+        rules.push(json!({
             "inbound": ["tun-in"],
             "process_name": proxy_names,
             "outbound": split.proxy_outbound
@@ -991,23 +960,14 @@ fn apply_split_routing(cfg: &mut serde_json::Value, split: &SplitRoutingSettings
         .filter(|s| !s.is_empty())
         .collect();
     if !proxy_domains.is_empty() {
-        new_rules.push(json!({
+        rules.push(json!({
             "inbound": ["tun-in"],
             "domain_suffix": proxy_domains,
             "outbound": split.proxy_outbound
         }));
     }
 
-    // 4) Вставляем после sniff/hijack-dns
-    if !new_rules.is_empty() {
-        let mut insert_at = 0usize;
-        for (i, r) in rules.iter().enumerate() {
-            if is_action(r, "sniff") || is_action(r, "hijack-dns") {
-                insert_at = i + 1;
-            }
-        }
-        rules.splice(insert_at..insert_at, new_rules);
-    }
+    route.insert("rules".to_string(), Value::Array(rules));
 }
 
 #[tauri::command]
@@ -1050,12 +1010,12 @@ Get-Process |
   ConvertTo-Json -Depth 3
 "#;
 
-	let mut cmd = Command::new("powershell");
-	cmd.creation_flags(CREATE_NO_WINDOW);
-	let out = cmd
-		.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
-		.output()
-		.map_err(|e| e.to_string())?;
+    let mut cmd = Command::new("powershell");
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
+        .output()
+        .map_err(|e| e.to_string())?;
 
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).to_string());
@@ -1267,7 +1227,12 @@ fn list_running_processes() -> Result<Vec<RunningApp>, String> {
 /* TODO remove below */
 #[tauri::command]
 fn get_macos_tunneled_processes(state: SharedState) -> Vec<String> {
-    state.settings.lock().unwrap().macos_tunneled_processes.clone()
+    state
+        .settings
+        .lock()
+        .unwrap()
+        .macos_tunneled_processes
+        .clone()
 }
 
 #[tauri::command]
@@ -1303,7 +1268,8 @@ fn patch_config_for_macos_process_rules(cfg: &mut Value, settings: &LocalSetting
     if processes.is_empty() {
         return;
     }
-    let route = cfg.as_object_mut()
+    let route = cfg
+        .as_object_mut()
         .and_then(|root| root.get_mut("route"))
         .and_then(|v| v.as_object_mut());
     if route.is_none() {
@@ -1312,8 +1278,13 @@ fn patch_config_for_macos_process_rules(cfg: &mut Value, settings: &LocalSetting
             root.insert("route".to_string(), serde_json::json!({}));
         }
     }
-    let route = cfg.get_mut("route").and_then(|v| v.as_object_mut()).unwrap();
-    let rules = route.entry("rules".to_string()).or_insert_with(|| serde_json::json!([]));
+    let route = cfg
+        .get_mut("route")
+        .and_then(|v| v.as_object_mut())
+        .unwrap();
+    let rules = route
+        .entry("rules".to_string())
+        .or_insert_with(|| serde_json::json!([]));
     let rules_arr = rules.as_array_mut().unwrap();
     let rule = json!({
         "process_name": processes,
@@ -1324,106 +1295,107 @@ fn patch_config_for_macos_process_rules(cfg: &mut Value, settings: &LocalSetting
 
 #[tauri::command]
 fn get_autostart_status(state: SharedState, app: AppHandle) -> Result<Value, String> {
-	let desired = state.settings.lock().unwrap().autostart_enabled;
+    let desired = state.settings.lock().unwrap().autostart_enabled;
 
-	#[cfg(target_os = "windows")]
-	{
-		let enabled = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
-		return Ok(serde_json::json!({
-			"desired": desired,
-			"enabled": enabled
-		}));
-	}
+    #[cfg(target_os = "windows")]
+    {
+        let enabled = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
+        return Ok(serde_json::json!({
+            "desired": desired,
+            "enabled": enabled
+        }));
+    }
 
-	#[cfg(target_os = "macos")]
-	{
-		let desired = state.settings.lock().unwrap().autostart_enabled;
-		let home = std::env::var("HOME").unwrap_or_default();
-		let plist = Path::new(&home).join("Library/LaunchAgents/ru.ravel.ultunnel.plist");
-		let enabled = plist.exists();
+    #[cfg(target_os = "macos")]
+    {
+        let desired = state.settings.lock().unwrap().autostart_enabled;
+        let home = std::env::var("HOME").unwrap_or_default();
+        let plist = Path::new(&home).join("Library/LaunchAgents/ru.ravel.ultunnel.plist");
+        let enabled = plist.exists();
         return Ok(json!({
-		    "desired": desired,
-		    "enabled": enabled
-	    }));
-	}
+            "desired": desired,
+            "enabled": enabled
+        }));
+    }
 
-	#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-	{
-		Ok(serde_json::json!({
-			"desired": desired,
-			"enabled": false
-		}))
-	}
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        Ok(serde_json::json!({
+            "desired": desired,
+            "enabled": false
+        }))
+    }
 }
 
 #[tauri::command]
 fn set_autostart_enabled(state: SharedState, app: AppHandle, enabled: bool) -> Result<(), String> {
-	#[cfg(target_os = "windows")]
-	{
-		if enabled {
-			app.autolaunch().enable().map_err(|e| e.to_string())?;
-		} else {
-			app.autolaunch().disable().map_err(|e| e.to_string())?;
-		}
-	}
+    #[cfg(target_os = "windows")]
+    {
+        if enabled {
+            app.autolaunch().enable().map_err(|e| e.to_string())?;
+        } else {
+            app.autolaunch().disable().map_err(|e| e.to_string())?;
+        }
+    }
 
-	#[cfg(target_os = "macos")]
-	{
-		install_helper_if_needed()?;
-		let app_bundle = macos_find_app_bundle()?;
-		let uid = macos_get_uid();
-		macos_smjobbless::helper_set_autostart(HELPER_LABEL, enabled, &app_bundle, uid)?;
-	}
+    #[cfg(target_os = "macos")]
+    {
+        install_helper_if_needed()?;
+        let app_bundle = macos_find_app_bundle()?;
+        let uid = macos_get_uid();
+        macos_smjobbless::helper_set_autostart(HELPER_LABEL, enabled, &app_bundle, uid)?;
+    }
 
-	let mut s = state.settings.lock().unwrap();
-	s.autostart_enabled = enabled;
-	s.save(&state.settings_path)
+    let mut s = state.settings.lock().unwrap();
+    s.autostart_enabled = enabled;
+    s.save(&state.settings_path)
 }
 
 fn sync_autostart_on_startup(app: &AppHandle, state: &Arc<AppState>) {
-	#[cfg(target_os = "windows")]
-	{
-		let desired = state.settings.lock().unwrap().autostart_enabled;
-		let mgr = app.autolaunch();
+    #[cfg(target_os = "windows")]
+    {
+        let desired = state.settings.lock().unwrap().autostart_enabled;
+        let mgr = app.autolaunch();
 
-		if let Ok(current) = mgr.is_enabled() {
-			if desired && !current {
-				let _ = mgr.enable();
-			} else if !desired && current {
-				let _ = mgr.disable();
-			}
-		}
-	}
+        if let Ok(current) = mgr.is_enabled() {
+            if desired && !current {
+                let _ = mgr.enable();
+            } else if !desired && current {
+                let _ = mgr.disable();
+            }
+        }
+    }
 
-	#[cfg(target_os = "macos")]
-	{
-		let desired = state.settings.lock().unwrap().autostart_enabled;
-		if install_helper_if_needed().is_ok() {
-			if let Ok(app_bundle) = macos_find_app_bundle() {
-				let uid = macos_get_uid();
-				let _ = macos_smjobbless::helper_set_autostart(HELPER_LABEL, desired, &app_bundle, uid);
-			}
-		}
-	}
+    #[cfg(target_os = "macos")]
+    {
+        let desired = state.settings.lock().unwrap().autostart_enabled;
+        if install_helper_if_needed().is_ok() {
+            if let Ok(app_bundle) = macos_find_app_bundle() {
+                let uid = macos_get_uid();
+                let _ =
+                    macos_smjobbless::helper_set_autostart(HELPER_LABEL, desired, &app_bundle, uid);
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn macos_find_app_bundle() -> Result<PathBuf, String> {
-	let mut p = std::env::current_exe().map_err(|e| e.to_string())?;
-	loop {
-		if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-			if name.ends_with(".app") {
-				return Ok(p);
-			}
-		}
-		if !p.pop() {
-			break;
-		}
-	}
-	Err("Не удалось определить путь к .app из current_exe()".to_string())
+    let mut p = std::env::current_exe().map_err(|e| e.to_string())?;
+    loop {
+        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+            if name.ends_with(".app") {
+                return Ok(p);
+            }
+        }
+        if !p.pop() {
+            break;
+        }
+    }
+    Err("Не удалось определить путь к .app из current_exe()".to_string())
 }
 
 #[cfg(target_os = "macos")]
 fn macos_get_uid() -> i32 {
-	unsafe { libc::getuid() as i32 }
+    unsafe { libc::getuid() as i32 }
 }
