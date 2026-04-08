@@ -28,6 +28,7 @@ use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
 use std::time::Instant;
+use sysinfo::ProcessesToUpdate;
 #[cfg(target_os = "macos")]
 use sysinfo::System;
 use tauri::menu::Menu;
@@ -980,13 +981,13 @@ fn list_running_apps() -> Result<Vec<RunningApp>, String> {
     #[cfg(target_os = "macos")]
     {
         let mut sys = System::new_all();
-        sys.refresh_processes();
+        sys.refresh_processes(ProcessesToUpdate::All, false);
         let mut out: Vec<RunningApp> = sys
             .processes()
             .iter()
             .map(|(pid, proc_)| RunningApp {
                 pid: pid.to_string().parse::<u32>().unwrap_or(0),
-                name: proc_.name().to_string(),
+                name: proc_.name().to_os_string().into_string().unwrap(),
                 path: proc_.exe().map(|p| p.display().to_string()),
                 title: None,
             })
@@ -1198,7 +1199,7 @@ fn list_running_processes() -> Result<Vec<RunningApp>, String> {
     #[cfg(target_os = "macos")]
     {
         let mut sys = System::new_all();
-        sys.refresh_processes();
+        sys.refresh_processes(ProcessesToUpdate::All, false);
 
         let mut out: Vec<RunningApp> = sys
             .processes()
@@ -1207,7 +1208,7 @@ fn list_running_processes() -> Result<Vec<RunningApp>, String> {
                 let pid_u32: u32 = pid.to_string().parse::<u32>().unwrap_or(0);
                 RunningApp {
                     pid: pid_u32,
-                    name: proc_.name().to_string(),
+                    name: proc_.name().to_os_string().into_string().unwrap(),
                     path: proc_.exe().map(|p| p.display().to_string()),
                     title: None,
                 }
