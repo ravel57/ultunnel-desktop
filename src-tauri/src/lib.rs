@@ -10,6 +10,7 @@ use api::normalize_configs;
 use api::ProxyConfig;
 #[cfg(target_os = "macos")]
 use libc;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use serde_json::Map;
@@ -26,7 +27,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::time::Instant;
 use sysinfo::ProcessesToUpdate;
 #[cfg(target_os = "macos")]
@@ -46,6 +47,7 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 use tracing_appender::non_blocking::WorkerGuard;
+use uuid::Uuid;
 
 #[cfg(target_os = "macos")]
 const HELPER_LABEL: &str = "ru.ravel.ultunnel-macos.helper";
@@ -224,7 +226,7 @@ fn write_singbox_config(
     cfg: &Value,
     settings: &LocalSettings,
 ) -> Result<PathBuf, String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let dir = PathBuf::from("C:\\ProgramData\\Ultunnel");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
     let path: PathBuf = dir.join("singbox.json");
@@ -357,7 +359,7 @@ async fn singbox_stop_root(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn singbox_start_admin(app: AppHandle, cfg_path: String) -> Result<(), String> {
+fn singbox_start_admin(_app: AppHandle, cfg_path: String) -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     {
         return Err("Windows only".into());
@@ -365,42 +367,60 @@ fn singbox_start_admin(app: AppHandle, cfg_path: String) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        let exe_dir = std::env::current_exe()
-            .map_err(|e| e.to_string())?
-            .parent()
-            .ok_or("no exe dir".to_string())?
-            .to_path_buf();
-        let singbox = exe_dir.join("sing-box.exe");
-        if !singbox.exists() {
-            return Err(format!("sing-box not found: {}", singbox.display()));
+        let cmd_id = Uuid::new_v4().to_string();
+
+        send_service_command(ServiceCommand {
+            id: cmd_id.clone(),
+            cmd: "start".to_string(),
+            config_path: Some(cfg_path),
+            timestamp: SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs(),
+        })?;
+
+        let status = wait_for_command_result(&cmd_id, 5000)?;
+
+        if status.running {
+            return Ok(());
         }
-        runas::Command::new(singbox)
-            .arg("run")
-            .arg("-c")
-            .arg(cfg_path)
-            .show(false)
-            .status()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+
+        Err(status
+            .message
+            .unwrap_or_else(|| "service failed to start sing-box".to_string()))
     }
 }
 
 #[tauri::command]
-fn singbox_stop_admin(app: AppHandle) -> Result<(), String> {
+fn singbox_stop_admin(_app: AppHandle) -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     {
         return Err("Windows only".into());
     }
+
     #[cfg(target_os = "windows")]
     {
-        runas::Command::new("taskkill")
-            .arg("/IM")
-            .arg("sing-box.exe")
-            .arg("/F")
-            .show(false)
-            .status()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        let cmd_id = Uuid::new_v4().to_string();
+
+        send_service_command(ServiceCommand {
+            id: cmd_id.clone(),
+            cmd: "stop".to_string(),
+            config_path: None,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs(),
+        })?;
+
+        let status = wait_for_command_result(&cmd_id, 5000)?;
+
+        if !status.running {
+            return Ok(());
+        }
+
+        Err(status
+            .message
+            .unwrap_or_else(|| "service failed to stop sing-box".to_string()))
     }
 }
 
@@ -499,10 +519,7 @@ pub fn run() {
                 })
                 .build(app)?;
             let handle = app.handle();
-            let settings_path = handle
-                .path()
-                .app_data_dir()
-                .expect("cannot get app data dir")
+            let settings_path = PathBuf::from("C:\\ProgramData\\Ultunnel")
                 .join("config.json");
 
             let settings = LocalSettings::load(&settings_path);
@@ -660,7 +677,7 @@ fn wait_singbox_running_windows(timeout_ms: u64) -> bool {
 }
 
 fn app_log_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let dir = PathBuf::from("C:\\ProgramData\\Ultunnel");
     let logs_dir = dir.join("logs");
     fs::create_dir_all(&logs_dir).map_err(|e| e.to_string())?;
     Ok(logs_dir.join("app.log"))
@@ -1399,4 +1416,60 @@ fn macos_find_app_bundle() -> Result<PathBuf, String> {
 #[cfg(target_os = "macos")]
 fn macos_get_uid() -> i32 {
     unsafe { libc::getuid() as i32 }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceCommand {
+    id: String,
+    cmd: String,
+    config_path: Option<String>,
+    timestamp: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceStatus {
+    last_command_id: Option<String>,
+    running: bool,
+    pid: Option<u32>,
+    message: Option<String>,
+}
+
+fn service_dir() -> PathBuf {
+    PathBuf::from(r"C:\ProgramData\Ultunnel")
+}
+
+fn command_path() -> PathBuf {
+    service_dir().join("command.json")
+}
+
+fn status_path() -> PathBuf {
+    service_dir().join("status.json")
+}
+
+fn send_service_command(cmd: ServiceCommand) -> Result<(), String> {
+    fs::create_dir_all(service_dir()).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&cmd).map_err(|e| e.to_string())?;
+    fs::write(command_path(), json).map_err(|e| e.to_string())
+}
+
+fn read_service_status() -> Result<ServiceStatus, String> {
+    let s = fs::read_to_string(status_path()).map_err(|e| e.to_string())?;
+    serde_json::from_str(&s).map_err(|e| e.to_string())
+}
+
+fn wait_for_command_result(command_id: &str, timeout_ms: u64) -> Result<ServiceStatus, String> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+    while Instant::now() < deadline {
+        if let Ok(status) = read_service_status() {
+            if status.last_command_id.as_deref() == Some(command_id) {
+                return Ok(status);
+            }
+        }
+        sleep(Duration::from_millis(150));
+    }
+
+    Err("service response timeout".to_string())
 }
