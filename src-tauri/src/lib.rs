@@ -1112,7 +1112,6 @@ fn apply_socks5_inbound(cfg: &mut serde_json::Value, enabled: bool, proxy_outbou
             "tag": "socks-in",
             "listen": "127.0.0.1",
             "listen_port": 5613,
-            "sniff": true
         }));
     }
 
@@ -1133,7 +1132,9 @@ fn apply_socks5_inbound(cfg: &mut serde_json::Value, enabled: bool, proxy_outbou
         .and_then(|v| v.as_array_mut())
         .unwrap();
 
-    // удалить старое правило socks-in -> proxy
+    // удалить старые правила, относящиеся к socks-in:
+    // 1) sniff action для socks-in
+    // 2) простое правило socks-in -> outbound
     rules.retain(|r| {
         let o = match r.as_object() {
             Some(x) => x,
@@ -1145,28 +1146,35 @@ fn apply_socks5_inbound(cfg: &mut serde_json::Value, enabled: bool, proxy_outbou
             None => false,
         };
 
-        // удаляем только простое правило "inbound socks-in -> outbound proxy"
-        if inbound_is_socks {
-            let outbound = o.get("outbound").and_then(|v| v.as_str());
-            let has_action = o.contains_key("action");
-            let has_other_conditions = o.contains_key("process_name")
-                || o.contains_key("process_path")
-                || o.contains_key("domain_suffix")
-                || o.contains_key("ip_cidr")
-                || o.contains_key("port")
-                || o.contains_key("network")
-                || o.contains_key("protocol");
+        if !inbound_is_socks {
+            return true;
+        }
 
-            if !has_action && !has_other_conditions && outbound.is_some() {
-                return false;
-            }
+        let action = o.get("action").and_then(|v| v.as_str());
+        if action == Some("sniff") {
+            return false;
+        }
+
+        let outbound = o.get("outbound").and_then(|v| v.as_str());
+        let has_action = o.contains_key("action");
+        let has_other_conditions = o.contains_key("process_name")
+            || o.contains_key("process_path")
+            || o.contains_key("domain_suffix")
+            || o.contains_key("ip_cidr")
+            || o.contains_key("port")
+            || o.contains_key("network")
+            || o.contains_key("protocol");
+
+        if !has_action && !has_other_conditions && outbound.is_some() {
+            return false;
         }
 
         true
     });
 
     if enabled {
-        // вставить правило socks-in -> proxy как можно выше (после sniff/hijack-dns если они есть)
+        // вставить sniff и outbound-правило как можно выше
+        // сразу после уже существующих sniff/hijack-dns правил
         let mut insert_at = 0usize;
         for (i, r) in rules.iter().enumerate() {
             let action = r
@@ -1177,6 +1185,15 @@ fn apply_socks5_inbound(cfg: &mut serde_json::Value, enabled: bool, proxy_outbou
                 insert_at = i + 1;
             }
         }
+
+        rules.insert(
+            insert_at,
+            json!({
+                "inbound": ["socks-in"],
+                "action": "sniff"
+            }),
+        );
+        insert_at += 1;
 
         let out = if proxy_outbound.trim().is_empty() {
             "proxy"
