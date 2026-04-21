@@ -10,6 +10,7 @@ use api::normalize_configs;
 use api::ProxyConfig;
 #[cfg(target_os = "macos")]
 use libc;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use serde_json::Map;
@@ -38,14 +39,14 @@ use tauri::AppHandle;
 use tauri::Manager;
 use tauri::State;
 use tauri::WindowEvent;
-use tauri_plugin_autostart::MacosLauncher;
-use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::process::CommandChild;
+use tauri_plugin_single_instance::init as single_instance_init;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
 use tracing_appender::non_blocking::WorkerGuard;
+use futures_util::StreamExt;
 
 #[cfg(target_os = "macos")]
 const HELPER_LABEL: &str = "ru.ravel.ultunnel-macos.helper";
@@ -98,8 +99,7 @@ fn init_file_logger(app: &AppHandle) -> Result<WorkerGuard, String> {
         .with_line_number(true)
         .finish();
 
-    tracing::subscriber::set_global_default(subscriber)
-        .map_err(|e| e.to_string())?;
+    tracing::subscriber::set_global_default(subscriber).map_err(|e| e.to_string())?;
 
     Ok(guard)
 }
@@ -219,6 +219,30 @@ fn normalize_primary_outbound_tag(cfg: &mut Value) {
     }
 }
 
+fn ensure_clash_api(cfg: &mut Value) {
+    let root = match cfg.as_object_mut() {
+        Some(v) => v,
+        None => return,
+    };
+
+    let experimental = root
+        .entry("experimental".to_string())
+        .or_insert_with(|| json!({}));
+
+    let experimental_obj = match experimental.as_object_mut() {
+        Some(v) => v,
+        None => return,
+    };
+
+    experimental_obj.insert(
+        "clash_api".to_string(),
+        json!({
+            "external_controller": "127.0.0.1:9090",
+            "secret": "ultunnel-local-secret"
+        }),
+    );
+}
+
 fn write_singbox_config(
     app: &AppHandle,
     cfg: &Value,
@@ -250,6 +274,7 @@ fn write_singbox_config(
         settings.socks5_inbound,
         &settings.split_routing.proxy_outbound,
     );
+    ensure_clash_api(&mut v);
 
     let json = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
     fs::write(&path, json).map_err(|e| e.to_string())?;
@@ -444,11 +469,10 @@ async fn load_configs(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, St
         *stored = configs.clone();
     }
 
-    save_configs_to_file(&state.configs_path, &configs)
-        .map_err(|e| {
-            error!("Ошибка сохранения configs.json: {}", e);
-            e
-        })?;
+    save_configs_to_file(&state.configs_path, &configs).map_err(|e| {
+        error!("Ошибка сохранения configs.json: {}", e);
+        e
+    })?;
 
     let names = configs.into_iter().map(|c| c.name).collect();
     info!("Список конфигов обновлён");
@@ -459,15 +483,14 @@ async fn load_configs(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, St
 pub fn run() {
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_shell::init());
-
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    {
-        builder = builder.plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
-            None,
-        ));
-    }
+        .plugin(tauri_plugin_shell::init())
+        .plugin(single_instance_init(|app, _argv, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }));
 
     let app = builder
         .setup(|app| {
@@ -527,7 +550,6 @@ pub fn run() {
             }
 
             app.manage(state.clone());
-            sync_autostart_on_startup(&handle, &state);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -560,6 +582,7 @@ pub fn run() {
             set_macos_process_tunnel_enabled,
             get_autostart_status,
             set_autostart_enabled,
+            get_dashboard_stats,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -744,26 +767,37 @@ async fn singbox_start_platform(app: AppHandle, state: SharedState<'_>) -> Resul
 
     #[cfg(target_os = "macos")]
     {
-        let r = singbox_start_root(/*app,*/ cfg_path_str, None).await;
-        if r.is_ok() {
-            state.running.store(true, Ordering::Relaxed);
+        let r = singbox_start_root(cfg_path_str, None).await;
+        if r.is_err() {
+            state.running.store(false, Ordering::Relaxed);
+            return r;
         }
-        return r;
+
+        if !wait_for_clash_api(5000).await {
+            state.running.store(false, Ordering::Relaxed);
+            return Err("sing-box запустился, но Clash API на 127.0.0.1:9090 не ответил".into());
+        }
+
+        state.running.store(true, Ordering::Relaxed);
+        return Ok(());
     }
 
     #[cfg(target_os = "windows")]
     {
-        // запуск с UAC
         let r = singbox_start_admin(app, cfg_path_str);
         if r.is_err() {
             state.running.store(false, Ordering::Relaxed);
             return r;
         }
 
-        // ждём, чтобы с первого клика UI увидел "запущено"
         if !wait_singbox_running_windows(2500) {
             state.running.store(false, Ordering::Relaxed);
             return Err("sing-box не запустился (process not found)".into());
+        }
+
+        if !wait_for_clash_api(5000).await {
+            state.running.store(false, Ordering::Relaxed);
+            return Err("sing-box запустился, но Clash API на 127.0.0.1:9090 не ответил".into());
         }
 
         state.running.store(true, Ordering::Relaxed);
@@ -1326,13 +1360,23 @@ fn get_autostart_status(state: SharedState, app: AppHandle) -> Result<Value, Str
 
     #[cfg(target_os = "macos")]
     {
-        let desired = state.settings.lock().unwrap().autostart_enabled;
         let home = std::env::var("HOME").unwrap_or_default();
         let plist = Path::new(&home).join("Library/LaunchAgents/ru.ravel.ultunnel.plist");
-        let enabled = plist.exists();
+
+        let plist_exists = plist.exists();
+
+        let loaded = std::process::Command::new("/bin/launchctl")
+            .args([
+                "print",
+                &format!("gui/{}/ru.ravel.ultunnel", macos_get_uid()),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
         return Ok(json!({
             "desired": desired,
-            "enabled": enabled
+            "enabled": plist_exists && loaded
         }));
     }
 
@@ -1346,54 +1390,44 @@ fn get_autostart_status(state: SharedState, app: AppHandle) -> Result<Value, Str
 }
 
 #[tauri::command]
-fn set_autostart_enabled(state: SharedState, app: AppHandle, enabled: bool) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        if enabled {
-            app.autolaunch().enable().map_err(|e| e.to_string())?;
-        } else {
-            app.autolaunch().disable().map_err(|e| e.to_string())?;
-        }
-    }
-
+fn set_autostart_enabled(state: SharedState, _app: AppHandle, enabled: bool) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        install_helper_if_needed()?;
-        let app_bundle = macos_find_app_bundle()?;
-        let uid = macos_get_uid();
-        macos_smjobbless::helper_set_autostart(HELPER_LABEL, enabled, &app_bundle, uid)?;
+        let home = std::env::var("HOME").unwrap_or_default();
+        let plist = Path::new(&home).join("Library/LaunchAgents/ru.ravel.ultunnel.plist");
+        let system_enabled = plist.exists();
+
+        {
+            let s = state.settings.lock().unwrap();
+            if s.autostart_enabled == enabled && system_enabled == enabled {
+                return Ok(());
+            }
+        }
+
+        if system_enabled != enabled {
+            install_helper_if_needed()?;
+            let app_bundle = macos_find_app_bundle()?;
+            let uid = macos_get_uid();
+            macos_smjobbless::helper_set_autostart(HELPER_LABEL, enabled, &app_bundle, uid)?;
+        }
+
+        let mut s = state.settings.lock().unwrap();
+        s.autostart_enabled = enabled;
+        return s.save(&state.settings_path);
     }
 
-    let mut s = state.settings.lock().unwrap();
-    s.autostart_enabled = enabled;
-    s.save(&state.settings_path)
-}
-
-fn sync_autostart_on_startup(app: &AppHandle, state: &Arc<AppState>) {
     #[cfg(target_os = "windows")]
     {
-        let desired = state.settings.lock().unwrap().autostart_enabled;
-        let mgr = app.autolaunch();
-
-        if let Ok(current) = mgr.is_enabled() {
-            if desired && !current {
-                let _ = mgr.enable();
-            } else if !desired && current {
-                let _ = mgr.disable();
-            }
-        }
+        let mut s = state.settings.lock().unwrap();
+        s.autostart_enabled = enabled;
+        return s.save(&state.settings_path);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let desired = state.settings.lock().unwrap().autostart_enabled;
-        if install_helper_if_needed().is_ok() {
-            if let Ok(app_bundle) = macos_find_app_bundle() {
-                let uid = macos_get_uid();
-                let _ =
-                    macos_smjobbless::helper_set_autostart(HELPER_LABEL, desired, &app_bundle, uid);
-            }
-        }
+        let mut s = state.settings.lock().unwrap();
+        s.autostart_enabled = enabled;
+        return s.save(&state.settings_path);
     }
 }
 
@@ -1416,4 +1450,153 @@ fn macos_find_app_bundle() -> Result<PathBuf, String> {
 #[cfg(target_os = "macos")]
 fn macos_get_uid() -> i32 {
     unsafe { libc::getuid() as i32 }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardStats {
+    up_bps: i64,
+    down_bps: i64,
+    active_connections: usize,
+    memory_mb: u64,
+    core_version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrafficResponse {
+    up: i64,
+    down: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConnectionsResponse {
+    connections: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VersionResponse {
+    version: Option<String>,
+}
+
+#[tauri::command]
+async fn get_dashboard_stats(_app: AppHandle) -> Result<DashboardStats, String> {
+    let client = reqwest::Client::new();
+    let secret = "ultunnel-local-secret";
+
+    let traffic_resp = client
+        .get("http://127.0.0.1:9090/traffic")
+        .bearer_auth(secret)
+        .send()
+        .await
+        .map_err(|e| format!("traffic request failed: {}", e))?;
+
+    let mut stream = traffic_resp.bytes_stream();
+    let mut buffer = String::new();
+    let first_line: String;
+
+    loop {
+        let chunk = stream
+            .next()
+            .await
+            .ok_or("traffic stream ended unexpectedly".to_string())?
+            .map_err(|e| format!("traffic stream read failed: {}", e))?;
+
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        if let Some(pos) = buffer.find('\n') {
+            first_line = buffer[..pos].trim().to_string();
+            break;
+        }
+
+        let trimmed = buffer.trim();
+        if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            first_line = trimmed.to_string();
+            break;
+        }
+    }
+
+    let traffic: TrafficResponse =
+        serde_json::from_str(&first_line).map_err(|e| format!("traffic parse failed: {}", e))?;
+
+    let connections = match client
+        .get("http://127.0.0.1:9090/connections")
+        .bearer_auth(secret)
+        .send()
+        .await
+    {
+        Ok(resp) => resp
+            .json::<ConnectionsResponse>()
+            .await
+            .unwrap_or(ConnectionsResponse { connections: None }),
+        Err(_) => ConnectionsResponse { connections: None },
+    };
+
+    let version = match client
+        .get("http://127.0.0.1:9090/version")
+        .bearer_auth(secret)
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.json::<VersionResponse>().await {
+            Ok(v) => v.version,
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+
+    let memory_mb = current_singbox_memory_mb();
+
+    Ok(DashboardStats {
+        up_bps: traffic.up,
+        down_bps: traffic.down,
+        active_connections: connections.connections.unwrap_or_default().len(),
+        memory_mb,
+        core_version: version,
+    })
+}
+
+fn current_singbox_memory_mb() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        return 0;
+    }
+
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
+
+    let total_kb: u64 = sys
+        .processes()
+        .values()
+        .filter(|p| {
+            let name = p.name().to_string_lossy().to_ascii_lowercase();
+            name == "sing-box" || name == "sing-box.exe"
+        })
+        .map(|p| p.memory())
+        .sum();
+
+    total_kb / 1024
+}
+
+async fn wait_for_clash_api(timeout_ms: u64) -> bool {
+    let client = reqwest::Client::new();
+    let secret = "ultunnel-local-secret";
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+    while Instant::now() < deadline {
+        let ok = client
+            .get("http://127.0.0.1:9090/version")
+            .bearer_auth(secret)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+
+        if ok {
+            return true;
+        }
+
+        sleep(Duration::from_millis(150));
+    }
+
+    false
 }

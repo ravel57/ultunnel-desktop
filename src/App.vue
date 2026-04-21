@@ -5,232 +5,179 @@
 			<div class="title">{{ activeTab === 'control' ? 'Панель управления' : 'Настройки' }}</div>
 		</div>
 
-		<!-- Content -->
-		<div class="content">
-			<!-- CONTROL TAB -->
-			<div v-if="activeTab === 'control'" class="page">
-				<div class="card">
-					<div class="card-title">Профиль</div>
+		<!-- CONTROL TAB -->
+		<div v-if="activeTab === 'control'" class="page">
+			<div v-if="isRunning" class="card">
+				<div class="card-title">Статистика</div>
 
-					<div v-if="loadingProfiles" class="muted">Загрузка…</div>
+				<div class="statsGrid">
+					<div class="statItem">
+						<div class="statLabel">Скачивание</div>
+						<div class="statValue">{{ formatSpeed(dashboard.downBps) }}</div>
+					</div>
 
-					<div v-else class="list">
-						<label
-							v-for="name in profiles"
-							:key="name"
-							class="row"
-						>
-							<input
-								class="radio"
-								type="radio"
-								name="profile"
-								:value="name"
-								v-model="selectedProfile"
-								@change="onSelectProfile(name)"
-							/>
-							<span class="row-text">{{ name }}</span>
-						</label>
+					<div class="statItem">
+						<div class="statLabel">Отдача</div>
+						<div class="statValue">{{ formatSpeed(dashboard.upBps) }}</div>
+					</div>
 
-						<div v-if="!profiles.length" class="muted">
-							Профили не загружены. Нажмите «Обновить конфиги» в настройках.
-						</div>
+					<div class="statItem">
+						<div class="statLabel">Соединения</div>
+						<div class="statValue">{{ dashboard.activeConnections }}</div>
+					</div>
+
+					<div class="statItem">
+						<div class="statLabel">Память</div>
+						<div class="statValue">{{ dashboard.memoryMb }} MB</div>
+					</div>
+
+					<div class="statItem">
+						<div class="statLabel">Версия core</div>
+						<div class="statValue">{{ dashboard.coreVersion }}</div>
 					</div>
 				</div>
 			</div>
 
-			<!-- SETTINGS TAB -->
-			<div v-else class="page">
-				<!-- Access Key -->
-				<div class="card">
-					<div class="card-title">Ключ доступа</div>
+			<div v-if="isRunning" class="card">
+				<div class="card-title">График трафика</div>
+				<TrafficChart :items="trafficHistory"/>
+			</div>
 
+			<div class="card">
+				<div class="card-title">Профиль</div>
+
+				<div v-if="loadingProfiles" class="muted">Загрузка…</div>
+
+				<div v-else class="list">
+					<label
+						v-for="name in profiles"
+						:key="name"
+						class="row"
+					>
+						<input
+							class="radio"
+							type="radio"
+							name="profile"
+							:value="name"
+							v-model="selectedProfile"
+							@change="onSelectProfile(name)"
+						/>
+						<span class="row-text">{{ name }}</span>
+					</label>
+
+					<div v-if="!profiles.length" class="muted">
+						Профили не загружены. Нажмите «Обновить конфиги» в настройках.
+					</div>
+				</div>
+			</div>
+		</div>
+
+		<!-- SETTINGS TAB -->
+		<div v-else class="page">
+			<!-- Access Key -->
+			<div class="card">
+				<div class="card-title">Ключ доступа</div>
+
+				<input
+					class="input"
+					type="text"
+					placeholder="Введите ключ доступа…"
+					v-model="accessKey"
+					@blur="saveAccessKey"
+					@keyup.enter="saveAccessKey"
+				/>
+
+				<div class="actions">
+					<button class="btn" @click="refreshConfigs" :disabled="loadingConfigs">
+						{{ loadingConfigs ? 'Обновление…' : 'Обновить конфиги' }}
+					</button>
+				</div>
+
+				<div v-if="errorText" class="error">{{ errorText }}</div>
+			</div>
+
+			<!-- Logs -->
+			<div class="card">
+				<div class="row-between">
+					<div>
+						<div class="card-title">Логи</div>
+						<div class="muted">Откроется файл логов приложения</div>
+					</div>
+					<button class="btn btn-ghost" @click="openLogs">Открыть</button>
+				</div>
+			</div>
+
+			<div class="card">
+				<div class="card-title">Приложение</div>
+
+				<label class="row">
 					<input
-						class="input"
-						type="text"
-						placeholder="Введите ключ доступа…"
-						v-model="accessKey"
-						@blur="saveAccessKey"
-						@keyup.enter="saveAccessKey"
+						type="checkbox"
+						v-model="autostartEnabled"
+						:disabled="autostartLoading"
+						@change="saveAutostart"
 					/>
+					<span>Автозапуск при старте системы</span>
+				</label>
 
-					<div class="actions">
-						<button class="btn" @click="refreshConfigs" :disabled="loadingConfigs">
-							{{ loadingConfigs ? 'Обновление…' : 'Обновить конфиги' }}
+				<div class="muted" style="margin-top:6px" v-if="autostartNote">
+					{{ autostartNote }}
+				</div>
+			</div>
+
+			<!-- apps settings -->
+			<div class="card">
+				<div class="card-title">Маршрутизация</div>
+
+				<label class="row">
+					<input type="checkbox" v-model="split.enabled" @change="saveSplit"/>
+					<span>Раздельная маршрутизация</span>
+				</label>
+
+				<div class="splitBlock">
+					<div class="smallTitle">Пускать через прокси (apps → proxy)</div>
+					<div class="row">
+						<button class="btn btn-ghost" @click="openAppsPicker('proxyApps')">Выбрать из запущенных
 						</button>
 					</div>
-
-					<div v-if="errorText" class="error">{{ errorText }}</div>
-				</div>
-
-				<!-- Logs -->
-				<div class="card">
-					<div class="row-between">
-						<div>
-							<div class="card-title">Логи</div>
-							<div class="muted">Откроется файл логов приложения</div>
-						</div>
-						<button class="btn btn-ghost" @click="openLogs">Открыть</button>
-					</div>
-				</div>
-
-				<div class="card">
-					<div class="cardTitle">Приложение</div>
-
-					<label class="row">
-						<input
-							type="checkbox"
-							v-model="autostartEnabled"
-							:disabled="autostartLoading"
-							@change="saveAutostart"
-						/>
-						<span>Автозапуск при старте системы</span>
-					</label>
-
-					<div class="muted" style="margin-top:6px" v-if="autostartNote">
-						{{ autostartNote }}
-					</div>
-				</div>
-
-				<!-- apps settings -->
-				<div class="card">
-					<div class="cardTitle">Маршрутизация</div>
-
-					<label class="row">
-						<input type="checkbox" v-model="split.enabled" @change="saveSplit"/>
-						<span>Раздельная маршрутизация</span>
-					</label>
-
-					<div class="grid2">
-						<div>
-							<div class="smallTitle">Outbound proxy</div>
-							<input class="input" v-model="split.proxyOutbound" @change="saveSplit" placeholder="proxy"/>
-						</div>
-						<div>
-							<div class="smallTitle">Outbound direct</div>
-							<input class="input" v-model="split.directOutbound" @change="saveSplit"
-								   placeholder="direct"/>
-						</div>
-					</div>
-
-					<!--<div class="splitBlock">-->
-					<!--	<div class="smallTitle">Не пускать через прокси (apps → direct)</div>-->
-					<!--	<div class="row">-->
-					<!--		&lt;!&ndash;<input class="input" v-model="newBypassApp"&ndash;&gt;-->
-					<!--		&lt;!&ndash;	   placeholder="Windows: chrome.exe / macOS: Safari"/>&ndash;&gt;-->
-					<!--		&lt;!&ndash;<button class="btn" @click="addTo('bypassApps','newBypassApp')">Добавить</button>&ndash;&gt;-->
-					<!--		<button class="btn btn-ghost" @click="openAppsPicker('bypassApps')">Выбрать из запущенных-->
-					<!--		</button>-->
-					<!--	</div>-->
-					<!--	<div class="chips">-->
-					<!--	  <span class="chip" v-for="a in split.bypassApps" :key="a">-->
-					<!--		{{ a }} <button class="chipX" @click="removeFrom('bypassApps', a)">×</button>-->
-					<!--	  </span>-->
-					<!--	</div>-->
-					<!--</div>-->
-
-					<div class="splitBlock">
-						<div class="smallTitle">Пускать через прокси (apps → proxy)</div>
-						<div class="row">
-							<!--<input class="input" v-model="newProxyApp"-->
-							<!--	   placeholder="Windows: telegram.exe / macOS: Telegram"/>-->
-							<!--<button class="btn" @click="addTo('proxyApps','newProxyApp')">Добавить</button>-->
-							<button class="btn btn-ghost" @click="openAppsPicker('proxyApps')">Выбрать из запущенных
-							</button>
-						</div>
-						<div class="chips">
+					<div class="chips">
 							<span class="chip" v-for="a in split.proxyApps" :key="a">
 							{{ a }} <button class="chipX" @click="removeFrom('proxyApps', a)">×</button>
 							</span>
-						</div>
-						<div class="sep"></div>
 					</div>
+					<div class="sep"></div>
+				</div>
 
-					<!--<div class="splitBlock">-->
-					<!--	<div class="smallTitle">Не пускать через прокси (domains → direct)</div>-->
-					<!--	<div class="row">-->
-					<!--		<input class="input" v-model="newBypassDomain" placeholder="например: apple.com"/>-->
-					<!--		<button class="btn" @click="addTo('bypassDomains','newBypassDomain')">Добавить</button>-->
-					<!--	</div>-->
-					<!--	<div class="chips">-->
-					<!--	  <span class="chip" v-for="d in split.bypassDomains" :key="d">-->
-					<!--		{{ d }} <button class="chipX" @click="removeFrom('bypassDomains', d)">×</button>-->
-					<!--	  </span>-->
-					<!--	</div>-->
-					<!--</div>-->
-
-					<div class="splitBlock">
-						<div class="smallTitle">Пускать через прокси (domains → proxy)</div>
-						<div class="row">
-							<input class="input" v-model="newProxyDomain" placeholder="например: google.com"/>
-							<button class="btn" @click="addTo('proxyDomains','newProxyDomain')">Добавить</button>
-						</div>
-						<div class="chips">
+				<div class="splitBlock">
+					<div class="smallTitle">Пускать через прокси (domains → proxy)</div>
+					<div class="row">
+						<input class="input" v-model="newProxyDomain" placeholder="например: google.com"/>
+						<button class="btn" @click="addTo('proxyDomains','newProxyDomain')">Добавить</button>
+					</div>
+					<div class="chips">
 							<span class="chip" v-for="d in split.proxyDomains" :key="d">
 								{{ d }} <button class="chipX" @click="removeFrom('proxyDomains', d)">×</button>
 							</span>
-						</div>
-						<div class="sep"></div>
 					</div>
-
-					<div class="splitBlock">
-						<label class="row">
-							<input
-								type="checkbox"
-								v-model="socks5Inbound"
-								:disabled="!split.enabled"
-								@change="saveSocks5Inbound"
-							/>
-							<span>Включить браузерный прокси</span>
-						</label>
-						<div class="muted" v-if="!split.enabled" style="margin-top:6px">
-							Доступно только при включенной «Раздельной маршрутизации».
-						</div>
-					</div>
+					<div class="sep"></div>
 				</div>
 
-				<!-- App section -->
-				<!--<div class="card">-->
-				<!--	<div class="card-title">Приложение</div>-->
-				<!--	<div class="setting-row">-->
-				<!--		<div class="setting-label">Отображать скорость в уведомлении</div>-->
-				<!--		<select class="select" v-model="showSpeed">-->
-				<!--			<option value="on">Включено</option>-->
-				<!--			<option value="off">Выключено</option>-->
-				<!--		</select>-->
-				<!--	</div>-->
-				<!--	<div class="setting-row">-->
-				<!--		<div class="setting-label">Автоматическая проверка обновлений</div>-->
-				<!--		<select class="select" v-model="autoUpdate">-->
-				<!--			<option value="on">Включено</option>-->
-				<!--			<option value="off">Выключено</option>-->
-				<!--		</select>-->
-				<!--	</div>-->
-				<!--	<div class="actions grid3">-->
-				<!--		<button class="btn btn-ghost" @click="checkUpdates">Проверить обновление</button>-->
-				<!--		<button class="btn btn-ghost" @click="openPrivacy">Политика конфиденциальности</button>-->
-				<!--		<button class="btn btn-ghost" @click="openAbout">О приложении</button>-->
-				<!--	</div>-->
-				<!--</div>-->
-				<!-- Core section -->
-				<!--<div class="card">-->
-				<!--<div class="card-title">Ядро</div>-->
-				<!--	<div class="kv">-->
-				<!--		<div class="k">Версия</div>-->
-				<!--		<div class="v">{{ coreVersion }}</div>-->
-				<!--	</div>-->
-				<!--	<div class="kv">-->
-				<!--		<div class="k">Размер данных</div>-->
-				<!--		<div class="v">{{ coreDataSize }}</div>-->
-				<!--	</div>-->
-				<!--	<div class="setting-row">-->
-				<!--		<div class="setting-label">Ограничение памяти</div>-->
-				<!--		<select class="select" v-model="memLimit">-->
-				<!--			<option value="on">Включено</option>-->
-				<!--			<option value="off">Выключено</option>-->
-				<!--		</select>-->
-				<!--	</div>-->
-				<!--</div>-->
+				<div class="splitBlock">
+					<label class="row">
+						<input
+							type="checkbox"
+							v-model="socks5Inbound"
+							:disabled="!split.enabled"
+							@change="saveSocks5Inbound"
+						/>
+						<span>Включить браузерный прокси</span>
+					</label>
+					<div class="muted" v-if="!split.enabled" style="margin-top:6px">
+						Доступно только при включенной «Раздельной маршрутизации».
+					</div>
+				</div>
 			</div>
+
 		</div>
 
 		<!-- Floating Start/Stop button (like play button) -->
@@ -312,8 +259,25 @@
 </template>
 
 <script lang="ts">
+import {defineComponent, h} from 'vue'
+import {invoke} from '@tauri-apps/api/core'
+
 type SplitListKey = "bypassApps" | "proxyApps" | "bypassDomains" | "proxyDomains";
 type InputKey = "newBypassApp" | "newProxyApp" | "newBypassDomain" | "newProxyDomain";
+
+type TrafficPoint = {
+	time: string
+	up: number
+	down: number
+}
+
+type DashboardStats = {
+	upBps: number
+	downBps: number
+	activeConnections: number
+	memoryMb: number
+	coreVersion?: string | null
+}
 
 type SplitRoutingSettings = {
 	enabled: boolean
@@ -344,15 +308,117 @@ function defaultSplit(): SplitRoutingSettings {
 	}
 }
 
-import {defineComponent} from 'vue'
-import {invoke} from '@tauri-apps/api/core'
+const TrafficChart = defineComponent({
+	name: 'TrafficChart',
+	props: {
+		items: {
+			type: Array as () => TrafficPoint[],
+			required: true,
+		},
+	},
+	methods: {
+		buildPath(values: number[], width: number, height: number, maxValue: number): string {
+			if (!values.length) return ''
+
+			const safeMax = Math.max(maxValue, 1)
+			const stepX = values.length > 1 ? width / (values.length - 1) : width
+
+			return values
+				.map((value, index) => {
+					const x = index * stepX
+					const y = height - (value / safeMax) * height
+					return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`
+				})
+				.join(' ')
+		},
+	},
+	render() {
+		const items = this.items || []
+		const width = 640
+		const height = 220
+
+		if (!items.length) {
+			return h('div', {class: 'chartEmpty'}, 'Нет данных')
+		}
+
+		const upValues = items.map(x => Number(x.up || 0))
+		const downValues = items.map(x => Number(x.down || 0))
+		const maxValue = Math.max(1, ...upValues, ...downValues)
+
+		const upPath = this.buildPath(upValues, width, height, maxValue)
+		const downPath = this.buildPath(downValues, width, height, maxValue)
+
+		const grid = [0.25, 0.5, 0.75].map(ratio =>
+			h('line', {
+				x1: 0,
+				y1: height * ratio,
+				x2: width,
+				y2: height * ratio,
+				stroke: 'rgba(255,255,255,0.10)',
+				'stroke-width': 1,
+			})
+		)
+
+		return h('div', {class: 'chartWrap'}, [
+			h('svg', {
+				viewBox: `0 0 ${width} ${height}`,
+				class: 'trafficSvg',
+				preserveAspectRatio: 'none',
+			}, [
+				...grid,
+				h('path', {
+					d: downPath,
+					fill: 'none',
+					stroke: '#60a5fa',
+					'stroke-width': 3,
+					'stroke-linejoin': 'round',
+					'stroke-linecap': 'round',
+				}),
+				h('path', {
+					d: upPath,
+					fill: 'none',
+					stroke: '#c084fc',
+					'stroke-width': 3,
+					'stroke-linejoin': 'round',
+					'stroke-linecap': 'round',
+				}),
+			]),
+			h('div', {class: 'chartLegend'}, [
+				h('div', {class: 'legendItem'}, [
+					h('span', {class: 'legendDot down'}),
+					h('span', null, 'Down'),
+				]),
+				h('div', {class: 'legendItem'}, [
+					h('span', {class: 'legendDot up'}),
+					h('span', null, 'Up'),
+				]),
+			]),
+		])
+	},
+})
 
 export default defineComponent({
 	name: 'App',
+
+	components: {
+		TrafficChart,
+	},
+
 	data: () => ({
 		activeTab: 'control' as 'control' | 'settings',
 
 		isRunning: false,
+
+		dashboard: {
+			upBps: 0,
+			downBps: 0,
+			activeConnections: 0,
+			memoryMb: 0,
+			coreVersion: '—',
+		} as Required<DashboardStats>,
+
+		trafficHistory: [] as TrafficPoint[],
+		statsTimer: null as number | null,
 
 		profiles: [] as string[],
 		selectedProfile: '' as string,
@@ -395,6 +461,12 @@ export default defineComponent({
 		await this.bootstrap()
 		await this.loadSplit()
 		await this.loadSocks5Inbound()
+		await this.loadAutostart()
+		this.startStatsPolling()
+	},
+
+	beforeUnmount() {
+		this.stopStatsPolling()
 	},
 
 	methods: {
@@ -430,6 +502,8 @@ export default defineComponent({
 				if (this.isRunning) {
 					await invoke('singbox_stop_platform')
 					this.isRunning = false
+					this.trafficHistory = []
+					await this.loadDashboardStats()
 					return
 				}
 				if (!this.selectedProfile) {
@@ -438,6 +512,8 @@ export default defineComponent({
 				}
 				await invoke('singbox_start_platform')
 				this.isRunning = true
+				this.trafficHistory = []
+				await this.loadDashboardStats()
 			} catch (e: any) {
 				this.errorText = String(e)
 				this.isRunning = await invoke<boolean>('get_state').catch(() => false)
@@ -612,15 +688,16 @@ export default defineComponent({
 			this.autostartLoading = true
 			try {
 				const st = await invoke<{ desired: boolean; enabled: boolean }>('get_autostart_status')
-				this.autostartEnabled = !!st?.desired
-				this.autostartOsEnabled = !!st?.enabled
-
-				if (this.autostartOsEnabled !== this.autostartEnabled) {
-					this.autostartNote = this.autostartEnabled
-						? 'В системе автозапуск сейчас выключен. Включаю при следующем сохранении.'
-						: 'В системе автозапуск сейчас включен. Отключаю при следующем сохранении.'
+				const desired = !!st?.desired
+				const enabled = !!st?.enabled
+				this.autostartEnabled = enabled
+				this.autostartOsEnabled = enabled
+				if (enabled !== desired) {
+					this.autostartNote = desired
+						? 'Автозапуск сохранён как включённый, но в системе сейчас выключен.'
+						: 'Автозапуск сохранён как выключенный, но в системе сейчас включён.'
 				} else {
-					this.autostartNote = this.autostartEnabled ? 'В системе: включено.' : 'В системе: выключено.'
+					this.autostartNote = enabled ? 'В системе: включено.' : 'В системе: выключено.'
 				}
 			} catch (e: any) {
 				this.autostartNote = String(e)
@@ -640,6 +717,65 @@ export default defineComponent({
 			} finally {
 				this.autostartLoading = false
 			}
+		},
+
+		async loadDashboardStats() {
+			try {
+				const stats = await invoke<DashboardStats>('get_dashboard_stats')
+
+				this.dashboard.upBps = Number(stats?.upBps || 0)
+				this.dashboard.downBps = Number(stats?.downBps || 0)
+				this.dashboard.activeConnections = Number(stats?.activeConnections || 0)
+				this.dashboard.memoryMb = Number(stats?.memoryMb || 0)
+				this.dashboard.coreVersion = stats?.coreVersion || '—'
+
+				const now = new Date().toLocaleTimeString()
+
+				this.trafficHistory.push({
+					time: now,
+					up: this.dashboard.upBps,
+					down: this.dashboard.downBps,
+				})
+
+				if (this.trafficHistory.length > 30) {
+					this.trafficHistory.shift()
+				}
+			} catch (e: any) {
+				this.errorText = 'Статистика недоступна: ' + String(e)
+				this.dashboard.upBps = 0
+				this.dashboard.downBps = 0
+				this.dashboard.activeConnections = 0
+				this.dashboard.memoryMb = 0
+				this.dashboard.coreVersion = '—'
+			}
+		},
+
+		startStatsPolling() {
+			this.stopStatsPolling()
+			void this.loadDashboardStats()
+
+			this.statsTimer = window.setInterval(() => {
+				if (this.activeTab === 'control' && this.isRunning) {
+					void this.loadDashboardStats()
+				}
+			}, 1000)
+		},
+
+		stopStatsPolling() {
+			if (this.statsTimer !== null) {
+				clearInterval(this.statsTimer)
+				this.statsTimer = null
+			}
+		},
+
+		formatSpeed(bytes: number): string {
+			if (bytes >= 1024 * 1024) {
+				return (bytes / 1024 / 1024).toFixed(2) + ' MB/s'
+			}
+			if (bytes >= 1024) {
+				return (bytes / 1024).toFixed(1) + ' KB/s'
+			}
+			return bytes + ' B/s'
 		},
 
 	},
@@ -665,135 +801,172 @@ export default defineComponent({
 	color-scheme: dark;
 }
 
+* {
+	box-sizing: border-box;
+}
+
 .app {
+	margin: 0;
+	padding: 16px 16px 110px;
 	height: 100vh;
-	display: flex;
-	flex-direction: column;
-	background: #1e1e1f;
-	color: #eaeaea;
+	overflow-y: auto;
+	overflow-x: hidden;
+	background:
+		radial-gradient(circle at top, rgba(112, 82, 255, 0.10), transparent 28%),
+		linear-gradient(180deg, #11131a 0%, #151821 100%);
+	color: #f3f5f7;
 	font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
 }
 
 /* Top */
 .topbar {
-	padding: 18px 18px 8px;
+	position: sticky;
+	top: 0;
+	z-index: 20;
+	padding: 4px 0 14px;
+	background: linear-gradient(180deg, rgba(17, 19, 26, 0.96) 0%, rgba(17, 19, 26, 0.84) 100%);
+	backdrop-filter: blur(10px);
 }
 
 .title {
-	font-size: 26px;
-	font-weight: 700;
-	letter-spacing: 0.2px;
-}
-
-/* Content */
-.content {
-	width: 50vw;
-	min-width: 300px;
-	flex: 1;
-	overflow: auto;
-	padding: 10px 14px 90px;
+	font-size: 28px;
+	font-weight: 800;
+	line-height: 1.1;
+	letter-spacing: -0.02em;
+	color: #ffffff;
 }
 
 .page {
 	display: flex;
 	flex-direction: column;
-	gap: 14px;
+	gap: 18px;
+	width: 100%;
+	max-width: 760px;
+	margin: 0 auto;
 }
 
 .card {
-	background: #2a2a2c;
-	border-radius: 16px;
-	padding: 14px;
-	box-shadow: 0 2px 10px rgba(0, 0, 0, .25);
-	border: 1px solid rgba(255, 255, 255, .06);
+	background: rgba(24, 28, 39, 0.92);
+	border-radius: 20px;
+	padding: 18px;
+	border: 1px solid rgba(255, 255, 255, 0.10);
+	box-shadow:
+		0 10px 30px rgba(0, 0, 0, 0.28),
+		inset 0 1px 0 rgba(255, 255, 255, 0.03);
 }
 
 .card-title {
-	font-weight: 700;
-	font-size: 18px;
-	margin-bottom: 10px;
+	font-weight: 800;
+	font-size: 22px;
+	line-height: 1.2;
+	margin-bottom: 14px;
+	color: #ffffff;
 }
 
 .list {
 	display: flex;
 	flex-direction: column;
+	gap: 8px;
 }
 
 .row {
 	display: flex;
 	align-items: center;
 	gap: 12px;
-	padding: 12px 6px;
-	border-top: 1px solid rgba(255, 255, 255, .08);
-}
-
-.row:first-of-type {
-	border-top: none;
+	padding: 12px 0;
 }
 
 .row-text {
 	font-size: 16px;
+	line-height: 1.4;
+	color: #edf1f7;
 }
 
 .radio {
 	width: 18px;
 	height: 18px;
-	accent-color: #b48cff;
+	accent-color: #8b5cf6;
+	flex: 0 0 auto;
+}
+
+input[type="checkbox"] {
+	width: 18px;
+	height: 18px;
+	accent-color: #4f8cff;
+	flex: 0 0 auto;
 }
 
 .input {
 	width: 100%;
-	border: none;
+	min-height: 50px;
 	outline: none;
-	background: #242426;
-	color: #f2f2f2;
-	padding: 12px 12px;
-	border-radius: 12px;
-	border: 1px solid rgba(255, 255, 255, .08);
+	background: #202534;
+	color: #f8fafc;
+	padding: 13px 15px;
+	border-radius: 14px;
+	border: 1px solid rgba(255, 255, 255, 0.10);
+	font-size: 16px;
+	line-height: 1.4;
+	transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+}
+
+.input::placeholder {
+	color: rgba(226, 232, 240, 0.45);
+}
+
+.input:focus {
+	border-color: rgba(96, 165, 250, 0.55);
+	box-shadow: 0 0 0 4px rgba(96, 165, 250, 0.12);
+	background: #23293a;
 }
 
 .actions {
-	margin-top: 12px;
+	margin-top: 14px;
 	display: flex;
-	gap: 10px;
+	gap: 12px;
 	flex-wrap: wrap;
 }
 
-.grid3 {
-	display: grid;
-	grid-template-columns: 1fr 1fr 1fr;
-	gap: 10px;
-}
-
-@media (max-width: 520px) {
-	.grid3 {
-		grid-template-columns: 1fr;
-	}
-}
-
 .btn {
-	background: #3a3a3e;
-	color: #fff;
-	border: 1px solid rgba(255, 255, 255, .10);
-	border-radius: 12px;
-	padding: 10px 12px;
+	background: linear-gradient(180deg, #4f8cff 0%, #3c74ea 100%);
+	color: #ffffff;
+	border: none;
+	border-radius: 14px;
+	padding: 12px 16px;
 	cursor: pointer;
+	font-size: 15px;
+	font-weight: 700;
+	line-height: 1.2;
+	min-height: 48px;
+	transition: transform 0.14s ease, opacity 0.14s ease, filter 0.14s ease;
+}
+
+.btn:hover {
+	filter: brightness(1.06);
+}
+
+.btn:active {
+	transform: translateY(1px);
 }
 
 .btn:disabled {
-	opacity: .6;
+	opacity: 0.55;
 	cursor: default;
+	filter: none;
+	transform: none;
 }
 
 .btn-ghost {
-	background: transparent;
+	background: rgba(255, 255, 255, 0.05);
+	color: #f3f5f7;
+	border: 1px solid rgba(255, 255, 255, 0.10);
 }
 
 .row-between {
 	display: flex;
 	justify-content: space-between;
 	align-items: center;
-	gap: 10px;
+	gap: 12px;
 }
 
 .setting-row {
@@ -801,90 +974,224 @@ export default defineComponent({
 	align-items: center;
 	justify-content: space-between;
 	gap: 12px;
-	padding: 10px 0;
-	border-top: 1px solid rgba(255, 255, 255, .08);
-}
-
-.setting-row:first-of-type {
-	border-top: none;
+	padding: 12px 0;
 }
 
 .setting-label {
-	font-size: 14px;
-	color: rgba(255, 255, 255, .85);
+	font-size: 15px;
+	line-height: 1.4;
+	color: #e8edf5;
 }
 
 .select {
-	background: #242426;
-	color: #f2f2f2;
-	border: 1px solid rgba(255, 255, 255, .08);
-	border-radius: 10px;
-	padding: 8px 10px;
+	background: #202534;
+	color: #f8fafc;
+	border: 1px solid rgba(255, 255, 255, 0.10);
+	border-radius: 12px;
+	padding: 10px 12px;
 	outline: none;
 	min-width: 140px;
+	font-size: 15px;
 }
 
 .kv {
 	display: flex;
 	justify-content: space-between;
-	padding: 6px 0;
-	border-top: 1px solid rgba(255, 255, 255, .08);
-}
-
-.kv:first-of-type {
-	border-top: none;
-}
-
-.k {
-	color: rgba(255, 255, 255, .7);
-}
-
-.v {
-	color: rgba(255, 255, 255, .95);
-}
-
-.muted {
-	color: rgba(255, 255, 255, .65);
-	font-size: 13px;
 	padding: 8px 0;
 }
 
-.error {
-	margin-top: 10px;
-	color: #ff8a8a;
-	font-size: 13px;
+.k {
+	color: rgba(226, 232, 240, 0.68);
+	font-size: 14px;
 }
 
-/* Floating action button */
-.fab {
-	position: fixed;
-	right: 18px;
-	bottom: 78px;
-	width: 56px;
-	height: 56px;
-	border-radius: 16px;
+.v {
+	color: #f8fafc;
+	font-size: 14px;
+}
+
+.muted {
+	color: rgba(226, 232, 240, 0.72);
+	font-size: 14px;
+	line-height: 1.45;
+}
+
+.error {
+	margin-top: 12px;
+	padding: 12px 14px;
+	border-radius: 14px;
+	background: rgba(239, 68, 68, 0.14);
+	border: 1px solid rgba(239, 68, 68, 0.34);
+	color: #fecaca;
+	font-size: 14px;
+	line-height: 1.45;
+}
+
+.splitBlock {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	padding: 14px 0 0;
+}
+
+.smallTitle {
+	font-size: 15px;
+	font-weight: 700;
+	color: #f4f7fb;
+}
+
+.chips {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 10px;
+}
+
+.chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	padding: 9px 12px;
+	border-radius: 999px;
+	background: rgba(79, 140, 255, 0.12);
+	border: 1px solid rgba(79, 140, 255, 0.25);
+	color: #eaf2ff;
+	font-size: 14px;
+	line-height: 1.3;
+	max-width: 100%;
+	word-break: break-word;
+}
+
+.chipX {
 	border: none;
-	background: #d9d9dd;
-	color: #111;
-	font-size: 22px;
-	box-shadow: 0 10px 24px rgba(0, 0, 0, .35);
+	background: transparent;
+	color: #ffffff;
 	cursor: pointer;
+	font-size: 16px;
+	line-height: 1;
+	padding: 0;
+}
+
+.sep {
+	height: 1px;
+	background: rgba(255, 255, 255, 0.08);
+	margin-top: 6px;
+}
+
+/* Stats */
+.statsGrid {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 14px;
+}
+
+.statItem {
+	background: #202534;
+	border: 1px solid rgba(255, 255, 255, 0.10);
+	border-radius: 18px;
+	padding: 16px;
+	min-height: 106px;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+}
+
+.statLabel {
+	font-size: 15px;
+	color: rgba(226, 232, 240, 0.75);
+	margin-bottom: 12px;
+}
+
+.statValue {
+	font-size: 24px;
+	font-weight: 800;
+	line-height: 1.2;
+	color: #ffffff;
+	word-break: break-word;
+}
+
+.chartWrap {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+
+.trafficSvg {
+	width: 100%;
+	height: 240px;
+	display: block;
+	background: #202534;
+	border: 1px solid rgba(255, 255, 255, 0.10);
+	border-radius: 18px;
+}
+
+.chartLegend {
+	display: flex;
+	gap: 18px;
+	flex-wrap: wrap;
+}
+
+.legendItem {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 14px;
+	color: rgba(226, 232, 240, 0.82);
+}
+
+.legendDot {
+	width: 10px;
+	height: 10px;
+	border-radius: 999px;
+	display: inline-block;
+}
+
+.legendDot.down {
+	background: #60a5fa;
+}
+
+.legendDot.up {
+	background: #c084fc;
+}
+
+.chartEmpty {
+	height: 240px;
 	display: flex;
 	align-items: center;
 	justify-content: center;
-	padding: 0;
-	line-height: 1;
+	background: #202534;
+	border: 1px solid rgba(255, 255, 255, 0.10);
+	border-radius: 18px;
+	color: rgba(226, 232, 240, 0.72);
+	font-size: 15px;
+}
+
+/* FAB */
+.fab {
+	position: fixed;
+	right: 22px;
+	bottom: 96px;
+	z-index: 30;
+	width: 68px;
+	height: 68px;
+	border: none;
+	border-radius: 22px;
+	background: linear-gradient(180deg, #b48cff 0%, #8b5cf6 100%);
+	color: #ffffff;
+	font-size: 28px;
+	cursor: pointer;
+	box-shadow: 0 16px 28px rgba(139, 92, 246, 0.35);
+	display: flex;
+	align-items: center;
+	justify-content: center;
 }
 
 .fab.on {
-	background: #b48cff;
-	color: #111;
+	background: linear-gradient(180deg, #ff7b7b 0%, #ef4444 100%);
+	box-shadow: 0 16px 28px rgba(239, 68, 68, 0.30);
 }
 
-.fab > span {
-	display: inline-block;
+.fabIcon {
 	line-height: 1;
-	transform: translateY(-1px);
 }
 
 /* Bottom nav */
@@ -893,134 +1200,66 @@ export default defineComponent({
 	left: 0;
 	right: 0;
 	bottom: 0;
-	height: 64px;
-	display: flex;
-	background: #2a2a2c;
-	border-top: 1px solid rgba(255, 255, 255, .08);
+	z-index: 25;
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 0;
+	padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+	background: rgba(17, 19, 26, 0.94);
+	backdrop-filter: blur(12px);
+	border-top: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .nav-btn {
-	flex: 1;
 	border: none;
 	background: transparent;
-	color: rgba(255, 255, 255, .65);
+	color: rgba(226, 232, 240, 0.68);
+	padding: 10px 8px;
+	border-radius: 14px;
+	cursor: pointer;
 	display: flex;
 	flex-direction: column;
 	align-items: center;
-	justify-content: center;
-	gap: 3px;
-	cursor: pointer;
+	gap: 4px;
+	transition: background 0.16s ease, color 0.16s ease;
 }
 
 .nav-btn.active {
-	color: #fff;
+	background: rgba(79, 140, 255, 0.12);
+	color: #ffffff;
 }
 
 .nav-ico {
-	font-size: 18px;
-	line-height: 18px;
-}
-
-.nav-txt {
-	font-size: 12px;
-}
-
-.card {
-	background: #1f1f1f;
-	border-radius: 16px;
-	padding: 16px;
-	margin: 12px 0;
-}
-
-.cardTitle {
-	font-size: 18px;
-	font-weight: 700;
-	margin-bottom: 12px;
-}
-
-.smallTitle {
-	opacity: .8;
-	font-size: 12px;
-	margin: 10px 0 6px;
-}
-
-.row {
-	display: flex;
-	align-items: center;
-	gap: 10px;
-}
-
-.grid2 {
-	display: grid;
-	grid-template-columns:1fr 1fr;
-	gap: 12px;
-}
-
-.input {
-	flex: 1;
-	background: #2a2a2a;
-	border: 1px solid #3a3a3a;
-	color: #fff;
-	border-radius: 10px;
-	padding: 10px 12px;
-}
-
-.btn {
-	background: #3b82f6;
-	color: #fff;
-	border: none;
-	border-radius: 10px;
-	padding: 10px 12px;
-	cursor: pointer;
-}
-
-.splitBlock {
-	margin-top: 12px;
-}
-
-.chips {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 8px;
-	margin-top: 10px;
-}
-
-.chip {
-	background: #2a2a2a;
-	border: 1px solid #3a3a3a;
-	border-radius: 999px;
-	padding: 6px 10px;
-	display: flex;
-	align-items: center;
-	gap: 8px;
-}
-
-.chipX {
-	background: transparent;
-	border: none;
-	color: #fff;
-	cursor: pointer;
-	font-size: 16px;
+	font-size: 20px;
 	line-height: 1;
 }
 
+.nav-txt {
+	font-size: 13px;
+	font-weight: 600;
+	line-height: 1.2;
+}
+
+/* Modal */
 .modalOverlay {
 	position: fixed;
 	inset: 0;
-	background: rgba(0, 0, 0, .45);
+	z-index: 40;
+	background: rgba(7, 10, 16, 0.68);
+	backdrop-filter: blur(6px);
+	padding: 24px;
 	display: flex;
 	align-items: center;
 	justify-content: center;
-	padding: 16px;
-	z-index: 9999;
 }
 
 .modal {
-	width: min(900px, 100%);
-	max-height: min(80vh, 760px);
-	background: #14141a;
-	border: 1px solid rgba(255, 255, 255, .08);
-	border-radius: 14px;
+	width: min(980px, 100%);
+	max-height: min(88vh, 920px);
+	background: #161b25;
+	border: 1px solid rgba(255, 255, 255, 0.10);
+	border-radius: 22px;
+	box-shadow: 0 18px 42px rgba(0, 0, 0, 0.40);
 	overflow: hidden;
 	display: flex;
 	flex-direction: column;
@@ -1030,69 +1269,121 @@ export default defineComponent({
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
-	padding: 12px 12px;
-	border-bottom: 1px solid rgba(255, 255, 255, .08);
+	padding: 18px 20px;
+	border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+	background: rgba(255, 255, 255, 0.02);
 }
 
 .modalTitle {
-	font-weight: 700;
+	font-weight: 800;
+	font-size: 18px;
+	color: #ffffff;
 }
 
 .appsList {
-	overflow: auto;
-	padding: 10px;
+	padding: 16px;
 	display: flex;
 	flex-direction: column;
-	gap: 8px;
+	gap: 12px;
+	overflow-y: auto;
+	min-height: 0;
 }
 
 .appRow {
 	text-align: left;
-	border: 1px solid rgba(255, 255, 255, .08);
-	background: rgba(255, 255, 255, .03);
-	border-radius: 12px;
-	padding: 10px 12px;
+	border: 1px solid rgba(255, 255, 255, 0.10);
+	background: #1e2431;
+	border-radius: 16px;
+	padding: 14px 16px;
 	cursor: pointer;
 	display: flex;
 	flex-direction: column;
-	gap: 6px;
+	gap: 8px;
+	transition: background 0.16s ease, border-color 0.16s ease;
 }
 
 .appRow:hover {
-	background: rgba(255, 255, 255, .06);
+	background: #242c3b;
+	border-color: rgba(96, 165, 250, 0.28);
 }
 
 .appMain {
 	display: flex;
-	align-items: baseline;
-	justify-content: space-between;
-	gap: 12px;
+	flex-direction: column;
+	gap: 4px;
 }
 
 .appName {
-	font-weight: 700;
+	font-weight: 800;
+	font-size: 17px;
+	line-height: 1.3;
+	color: #ffffff;
+	word-break: break-word;
 }
 
 .appTitle {
-	color: rgba(255, 255, 255, .65);
-	font-size: 12px;
+	color: rgba(226, 232, 240, 0.78);
+	font-size: 14px;
+	line-height: 1.4;
+	word-break: break-word;
 }
 
 .appPath {
-	color: rgba(255, 255, 255, .55);
-	font-size: 12px;
+	color: rgba(226, 232, 240, 0.62);
+	font-size: 13px;
+	line-height: 1.45;
 	word-break: break-all;
 }
 
 .modalHint {
-	padding: 10px 12px;
-	border-top: 1px solid rgba(255, 255, 255, .08);
+	padding: 14px 18px;
+	border-top: 1px solid rgba(255, 255, 255, 0.08);
+	background: rgba(255, 255, 255, 0.02);
 }
 
-.sep{
-	height: 1px;
-	background: rgba(255,255,255,.08);
-	margin-top: 14px;      /* линия “после кнопки/поля” */
-	margin-bottom: 14px;   /* отступ до следующего блока */
+/* Mobile */
+@media (max-width: 760px) {
+	.app {
+		padding: 14px 14px 108px;
+	}
+
+	.title {
+		font-size: 24px;
+	}
+
+	.card {
+		padding: 16px;
+		border-radius: 18px;
+	}
+
+	.card-title {
+		font-size: 20px;
+	}
+
+	.statsGrid {
+		grid-template-columns: 1fr;
+	}
+
+	.row-between {
+		flex-direction: column;
+		align-items: stretch;
+	}
+
+	.modalOverlay {
+		padding: 12px;
+		align-items: flex-end;
+	}
+
+	.modal {
+		max-height: 88vh;
+		border-radius: 20px 20px 0 0;
+	}
+
+	.fab {
+		right: 16px;
+		bottom: 92px;
+		width: 64px;
+		height: 64px;
+	}
 }
 </style>

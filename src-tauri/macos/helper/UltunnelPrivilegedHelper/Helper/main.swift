@@ -302,7 +302,26 @@ final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
             let appExec = "\(appPath)/Contents/MacOS/ultunnel-desktop"
 
             if enabled {
+                if !FileManager.default.isExecutableFile(atPath: appExec) {
+                    reply(2, "app executable not found or not executable: \(appExec)")
+                    return
+                }
+
                 let xml = plistXml(label: label, appExecPath: appExec)
+
+                if FileManager.default.fileExists(atPath: plistPath),
+                let existing = try? String(contentsOfFile: plistPath, encoding: .utf8),
+                existing == xml {
+                    let result = try? runCapture("/bin/launchctl", [
+                        "asuser", "\(uid)", "/bin/launchctl", "print", "gui/\(uid)/\(label)"
+                    ])
+                    let status = result?.0 ?? 1
+
+                    if status == 0 {
+                        reply(0, "autostart already enabled")
+                        return
+                    }
+                }
                 try xml.write(toFile: plistPath, atomically: true, encoding: .utf8)
 
                 _ = try? runCapture("/usr/sbin/chown", ["\(uid):staff", plistPath])
@@ -316,7 +335,6 @@ final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
                     return
                 }
 
-                _ = try? runCapture("/bin/launchctl", ["asuser", "\(uid)", "/bin/launchctl", "kickstart", "-k", "gui/\(uid)/\(label)"])
                 reply(0, "autostart enabled")
             } else {
                 _ = try? runCapture("/bin/launchctl", ["asuser", "\(uid)", "/bin/launchctl", "bootout", "gui/\(uid)", plistPath])

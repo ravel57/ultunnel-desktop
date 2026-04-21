@@ -78,7 +78,7 @@ impl Default for LocalSettings {
             socks5_inbound: false,
             macos_process_tunnel_enabled: false,
             macos_tunneled_processes: vec![],
-			autostart_enabled: true,
+			autostart_enabled: false,
         }
     }
 }
