@@ -516,6 +516,7 @@ pub fn run() {
                         }
                     }
                     "quit" => {
+                        EXITING.store(true, Ordering::SeqCst);
                         app.exit(0);
                     }
                     _ => {}
@@ -554,6 +555,9 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
+                if EXITING.load(Ordering::SeqCst) {
+                    return;
+                }
                 api.prevent_close();
                 let _ = window.hide();
             }
