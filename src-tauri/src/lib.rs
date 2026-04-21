@@ -8,6 +8,7 @@ use crate::settings::SplitRoutingSettings;
 use api::fetch_raw_configs;
 use api::normalize_configs;
 use api::ProxyConfig;
+use futures_util::StreamExt;
 #[cfg(target_os = "macos")]
 use libc;
 use serde::Deserialize;
@@ -30,7 +31,6 @@ use std::thread::sleep;
 use std::time::Duration;
 use std::time::Instant;
 use sysinfo::ProcessesToUpdate;
-#[cfg(target_os = "macos")]
 use sysinfo::System;
 use tauri::menu::Menu;
 use tauri::menu::MenuItem;
@@ -39,6 +39,9 @@ use tauri::AppHandle;
 use tauri::Manager;
 use tauri::State;
 use tauri::WindowEvent;
+#[cfg(target_os = "macos")]
+use tauri_plugin_autostart::MacosLauncher;
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::process::CommandChild;
 use tauri_plugin_single_instance::init as single_instance_init;
@@ -46,7 +49,6 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 use tracing_appender::non_blocking::WorkerGuard;
-use futures_util::StreamExt;
 
 #[cfg(target_os = "macos")]
 const HELPER_LABEL: &str = "ru.ravel.ultunnel-macos.helper";
@@ -491,6 +493,20 @@ pub fn run() {
                 let _ = win.set_focus();
             }
         }));
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![]),
+        ));
+    }
+    #[cfg(any(target_os ="windows", target_os = "linux"))]
+    {
+        builder = builder.plugin(tauri_plugin_autostart::init(
+            Default::default(),
+            Some(vec![]),
+        ));
+    }
 
     let app = builder
         .setup(|app| {
@@ -1565,8 +1581,8 @@ fn current_singbox_memory_mb() -> u64 {
         return 0;
     }
 
-    let mut sys = sysinfo::System::new_all();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
+    let mut sys = System::new_all();
+    sys.refresh_processes(ProcessesToUpdate::All, false);
 
     let total_kb: u64 = sys
         .processes()
@@ -1578,7 +1594,7 @@ fn current_singbox_memory_mb() -> u64 {
         .map(|p| p.memory())
         .sum();
 
-    total_kb / 1024
+    total_kb / 1024 / 1024
 }
 
 async fn wait_for_clash_api(timeout_ms: u64) -> bool {
