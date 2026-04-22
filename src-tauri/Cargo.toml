@@ -32,6 +32,7 @@ tracing-appender = "0.2"
 tauri-plugin-single-instance = "2"
 futures-util = "0.3"
 tauri-plugin-autostart = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(mobile)", "cfg(desktop)"] }
