@@ -1054,21 +1054,30 @@ fn list_running_apps() -> Result<Vec<RunningApp>, String> {
 
 #[cfg(target_os = "windows")]
 fn list_running_apps_windows() -> Result<Vec<RunningApp>, String> {
-    // Берём только процессы с окном (MainWindowHandle != 0),
-    // чтобы было "как диспетчер задач" (активные приложения), а не сервисы/фон.
-    // Path может быть пустой для системных процессов — их отфильтруем.
     let ps = r#"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
 Get-Process |
   Where-Object { $_.MainWindowHandle -ne 0 -and $_.Path -and $_.Path -ne "" } |
   Select-Object Id,ProcessName,Path,MainWindowTitle |
   Sort-Object ProcessName |
-  ConvertTo-Json -Depth 3
+  ConvertTo-Json -Depth 3 -Compress
 "#;
 
-    let mut cmd = Command::new("powershell");
+    let mut cmd = Command::new("powershell.exe");
     cmd.creation_flags(CREATE_NO_WINDOW);
+
     let out = cmd
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ps,
+        ])
         .output()
         .map_err(|e| e.to_string())?;
 
@@ -1076,14 +1085,19 @@ Get-Process |
         return Err(String::from_utf8_lossy(&out.stderr).to_string());
     }
 
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stdout = String::from_utf8(out.stdout)
+        .map_err(|e| format!("PowerShell вернул не UTF-8: {e}"))?
+        .trim()
+        .trim_start_matches('\u{feff}')
+        .to_string();
+
     if stdout.is_empty() || stdout == "null" {
         return Ok(vec![]);
     }
 
-    let v: Value = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
+    let v: Value = serde_json::from_str(&stdout)
+        .map_err(|e| format!("Не удалось разобрать JSON процессов: {e}; stdout={stdout}"))?;
 
-    // ConvertTo-Json отдаёт либо объект (если 1 элемент), либо массив
     let arr = match v {
         Value::Array(a) => a,
         Value::Object(_) => vec![v],
@@ -1097,22 +1111,24 @@ Get-Process |
             .get("ProcessName")
             .and_then(|x| x.as_str())
             .unwrap_or("")
+            .trim()
             .to_string();
         let path = item
             .get("Path")
             .and_then(|x| x.as_str())
-            .map(|s| s.to_string());
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let title = item
             .get("MainWindowTitle")
             .and_then(|x| x.as_str())
-            .map(|s| s.to_string())
-            .filter(|s| !s.trim().is_empty());
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         if pname.is_empty() {
             continue;
         }
 
-        // Get-Process даёт имя без .exe — приведём к виду, который ожидает UI
         let name = if pname.to_ascii_lowercase().ends_with(".exe") {
             pname
         } else {
