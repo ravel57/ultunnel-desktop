@@ -44,6 +44,7 @@ use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::process::CommandChild;
+use tauri_plugin_shell::ShellExt;
 use tauri_plugin_single_instance::init as single_instance_init;
 use tracing::error;
 use tracing::info;
@@ -431,6 +432,100 @@ fn singbox_stop_admin(app: AppHandle) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(target_os = "linux")]
+fn relaunch_as_root_if_needed() -> Result<(), String> {
+    if is_root() {
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("Не удалось получить путь к exe: {e}"))?;
+
+    let display = std::env::var("DISPLAY").unwrap_or_default();
+    let wayland_display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+    let xauthority = std::env::var("XAUTHORITY").unwrap_or_default();
+    let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+    let dbus_session_bus_address = std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_default();
+
+    let mut cmd = std::process::Command::new("pkexec");
+
+    cmd.arg("env");
+
+    if !display.is_empty() {
+        cmd.arg(format!("DISPLAY={display}"));
+    }
+
+    if !wayland_display.is_empty() {
+        cmd.arg(format!("WAYLAND_DISPLAY={wayland_display}"));
+    }
+
+    if !xauthority.is_empty() {
+        cmd.arg(format!("XAUTHORITY={xauthority}"));
+    }
+
+    if !xdg_runtime_dir.is_empty() {
+        cmd.arg(format!("XDG_RUNTIME_DIR={xdg_runtime_dir}"));
+    }
+
+    if !dbus_session_bus_address.is_empty() {
+        cmd.arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus_session_bus_address}"));
+    }
+
+    cmd.arg(exe);
+
+    cmd.spawn()
+        .map_err(|e| format!("Не удалось перезапустить приложение через pkexec: {e}"))?;
+
+    std::process::exit(0);
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+async fn singbox_start(
+    app: AppHandle,
+    state: SharedState<'_>,
+    cfg_path: String,
+) -> Result<(), String> {
+    {
+        let guard = state.singbox.lock().unwrap();
+        if guard.is_some() {
+            return Ok(());
+        }
+    }
+
+    let sidecar = app
+        .shell()
+        .sidecar("sing-box")
+        .map_err(|e| format!("Не удалось найти sidecar sing-box: {e}"))?;
+
+    let (_rx, child) = sidecar
+        .args(["run", "-c", cfg_path.as_str()])
+        .spawn()
+        .map_err(|e| format!("Не удалось запустить sing-box: {e}"))?;
+
+    *state.singbox.lock().unwrap() = Some(child);
+
+    if !wait_for_clash_api(5000).await {
+        kill_singbox(state.inner());
+        return Err("sing-box запустился, но Clash API на 127.0.0.1:9090 не ответил".into());
+    }
+
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+async fn singbox_stop(
+    _app: AppHandle,
+    state: SharedState<'_>,
+) -> Result<(), String> {
+    kill_singbox(state.inner());
+    Ok(())
+}
+
 #[tauri::command]
 async fn load_configs(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {
     let access_key = {
@@ -483,6 +578,11 @@ async fn load_configs(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, St
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    if let Err(e) = relaunch_as_root_if_needed() {
+        eprintln!("{e}");
+    }
+
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
@@ -826,7 +926,7 @@ async fn singbox_start_platform(app: AppHandle, state: SharedState<'_>) -> Resul
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        let r = singbox_start(app, state).await;
+        let r = singbox_start(app, state.clone(), cfg_path_str).await;
         if r.is_ok() {
             state.running.store(true, Ordering::Relaxed);
         }
@@ -855,7 +955,7 @@ async fn singbox_stop_platform(
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        let r = singbox_stop(app, state).await;
+        let r = singbox_stop(app, state.clone()).await;
         state.running.store(false, Ordering::Relaxed);
         return r;
     }
@@ -1048,6 +1148,27 @@ fn list_running_apps() -> Result<Vec<RunningApp>, String> {
             .collect();
         out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         out.dedup_by(|a, b| a.pid == b.pid);
+        Ok(out)
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let mut sys = System::new_all();
+        sys.refresh_processes(ProcessesToUpdate::All, false);
+
+        let mut out: Vec<RunningApp> = sys
+            .processes()
+            .iter()
+            .map(|(pid, proc_)| RunningApp {
+                pid: pid.to_string().parse::<u32>().unwrap_or(0),
+                name: proc_.name().to_os_string().into_string().unwrap_or_default(),
+                path: proc_.exe().map(|p| p.display().to_string()),
+                title: None,
+            })
+            .collect();
+
+        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out.dedup_by(|a, b| a.pid == b.pid);
+
         Ok(out)
     }
 }
