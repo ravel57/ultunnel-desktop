@@ -1,4 +1,5 @@
 mod api;
+mod browser_api;
 #[cfg(target_os = "macos")]
 mod macos_smjobbless;
 mod settings;
@@ -8,6 +9,7 @@ use crate::settings::SplitRoutingSettings;
 use api::fetch_raw_configs;
 use api::normalize_configs;
 use api::ProxyConfig;
+use futures_util::StreamExt;
 #[cfg(target_os = "macos")]
 use libc;
 use serde::Deserialize;
@@ -22,6 +24,8 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -36,6 +40,7 @@ use tauri::menu::Menu;
 use tauri::menu::MenuItem;
 use tauri::tray::TrayIconBuilder;
 use tauri::AppHandle;
+use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
 use tauri::WindowEvent;
@@ -46,7 +51,6 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 use tracing_appender::non_blocking::WorkerGuard;
-use futures_util::StreamExt;
 
 #[cfg(target_os = "macos")]
 const HELPER_LABEL: &str = "ru.ravel.ultunnel-macos.helper";
@@ -57,6 +61,8 @@ const HELPER_DST: &str = "/Library/PrivilegedHelperTools/ru.ravel.ultunnel-macos
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 static EXITING: AtomicBool = AtomicBool::new(false);
+static PROFILE_CHECKING: AtomicBool = AtomicBool::new(false);
+
 
 pub struct AppState {
     pub settings_path: PathBuf,
@@ -372,10 +378,18 @@ async fn singbox_stop_root(app: AppHandle) -> Result<(), String> {
         let _ = macos_smjobbless::helper_stop_singbox(HELPER_LABEL)?;
         let _ = Command::new("/usr/bin/pkill")
             .args(["-x", "sing-box"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
-        let _ = Command::new("/usr/bin/killall").args(["sing-box"]).status();
+        let _ = Command::new("/usr/bin/killall")
+            .args(["sing-box"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         let _ = Command::new("/usr/bin/pkill")
             .args(["-f", "sing-box"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
         Ok(())
     }
@@ -551,6 +565,7 @@ pub fn run() {
             }
 
             app.manage(state.clone());
+            browser_api::spawn_browser_api(state.clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -587,6 +602,7 @@ pub fn run() {
             get_autostart_status,
             set_autostart_enabled,
             get_dashboard_stats,
+            check_profiles,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1249,6 +1265,106 @@ fn apply_socks5_inbound(cfg: &mut serde_json::Value, enabled: bool, proxy_outbou
     }
 }
 
+fn collect_tun_inbound_tags_for_profile_check(cfg: &serde_json::Value) -> Vec<String> {
+    cfg.get("inbounds")
+        .and_then(|v| v.as_array())
+        .map(|inbounds| {
+            inbounds
+                .iter()
+                .filter(|ib| ib.get("type").and_then(|v| v.as_str()) == Some("tun"))
+                .filter_map(|ib| ib.get("tag").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn configure_full_vpn_profile_check(cfg: &mut serde_json::Value, tun_tags: &[String]) {
+    let root = match cfg.as_object_mut() {
+        Some(v) => v,
+        None => return,
+    };
+
+    // Проверка профилей должна поднимать именно полноценный TUN/VPN,
+    // а не локальный proxy-inbound. Поэтому для временного конфига проверки
+    // отключаем split-routing/process-routing и делаем proxy финальным outbound
+    // для всего системного трафика, попадающего в TUN.
+    if !root.contains_key("route") || !root.get("route").unwrap().is_object() {
+        root.insert("route".into(), Value::Object(Map::new()));
+    }
+
+    let route = root
+        .get_mut("route")
+        .and_then(|v| v.as_object_mut())
+        .unwrap();
+
+    route.insert("final".to_string(), Value::String("proxy".to_string()));
+    route.insert("auto_detect_interface".to_string(), Value::Bool(true));
+    route.remove("find_process");
+
+    // Убираем правила, которые могли увести часть трафика напрямую по process_name,
+    // process_path, domain_suffix и т.п. Для проверки нужен чистый full-tunnel:
+    // DNS перехватывается, остальной трафик идет в route.final = proxy.
+    route.insert(
+        "rules".to_string(),
+        Value::Array(vec![
+            json!({ "inbound": tun_tags, "action": "sniff" }),
+            json!({ "protocol": ["dns"], "action": "hijack-dns" }),
+        ]),
+    );
+}
+
+fn ensure_tun_inbound_exists_for_profile_check(cfg: &serde_json::Value) -> Result<Vec<String>, String> {
+    let tun_tags = collect_tun_inbound_tags_for_profile_check(cfg);
+
+    if !tun_tags.is_empty() {
+        Ok(tun_tags)
+    } else {
+        Err("В конфиге нет TUN inbound, поэтому полноценный VPN для проверки поднять нельзя".to_string())
+    }
+}
+
+fn write_singbox_config_for_profile_check(
+    app: &AppHandle,
+    cfg: &Value,
+    settings: &LocalSettings,
+) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let path: PathBuf = dir.join("singbox-profile-check.json");
+    let mut v = cfg.clone();
+
+    normalize_primary_outbound_tag(&mut v);
+    let tun_tags = ensure_tun_inbound_exists_for_profile_check(&v)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = settings;
+        patch_config_for_macos(&mut v);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut full_tunnel_split = settings.split_routing.clone();
+        full_tunnel_split.enabled = false;
+        patch_config_for_windows(&mut v, &full_tunnel_split);
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let _ = settings;
+    }
+
+    configure_full_vpn_profile_check(&mut v, &tun_tags);
+    ensure_clash_api(&mut v);
+
+    let json = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())?;
+
+    Ok(path)
+}
+
 #[tauri::command]
 fn list_running_processes() -> Result<Vec<RunningApp>, String> {
     #[cfg(target_os = "macos")]
@@ -1466,6 +1582,47 @@ struct DashboardStats {
     core_version: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileCheckResult {
+    name: String,
+    ok: bool,
+    ip: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileCheckEvent {
+    name: String,
+    index: usize,
+    total: usize,
+    status: String,
+    ip: Option<String>,
+    error: Option<String>,
+}
+
+struct ProfileCheckGuard;
+
+impl Drop for ProfileCheckGuard {
+    fn drop(&mut self) {
+        PROFILE_CHECKING.store(false, Ordering::SeqCst);
+    }
+}
+
+fn try_begin_profile_check() -> Result<ProfileCheckGuard, String> {
+    PROFILE_CHECKING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map(|_| ProfileCheckGuard)
+        .map_err(|_| "Проверка профилей уже выполняется".to_string())
+}
+
+fn emit_profile_check_event(app: &AppHandle, event: ProfileCheckEvent) {
+    if let Err(e) = app.emit("profile-check-progress", event) {
+        warn!("Не удалось отправить событие profile-check-progress: {}", e);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct TrafficResponse {
     up: i64,
@@ -1480,6 +1637,234 @@ struct ConnectionsResponse {
 #[derive(Debug, Deserialize)]
 struct VersionResponse {
     version: Option<String>,
+}
+
+
+async fn fetch_ipinfo_ip_through_full_vpn() -> Result<String, String> {
+    // Здесь намеренно НЕ используется reqwest::Proxy.
+    // Проверка должна идти как обычный системный трафик приложения после поднятия TUN,
+    // чтобы IP был получен через полноценный VPN-маршрут, а не через локальный порт.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .get("https://ipinfo.io/ip")
+        .header(reqwest::header::USER_AGENT, "ultunnel-desktop")
+        .send()
+        .await
+        .map_err(|e| format!("ipinfo request through full VPN failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("ipinfo through full VPN returned HTTP {}", resp.status()));
+    }
+
+    let ip = resp
+        .text()
+        .await
+        .map_err(|e| format!("ipinfo response through full VPN read failed: {}", e))?
+        .trim()
+        .to_string();
+
+    if ip.is_empty() {
+        Err("ipinfo through full VPN returned empty IP".to_string())
+    } else {
+        Ok(ip)
+    }
+}
+
+
+fn is_platform_running(state: &Arc<AppState>) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        return is_singbox_running_windows();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        state.running.load(Ordering::Relaxed)
+    }
+}
+
+async fn stop_platform_for_profile_check(app: AppHandle, state: &Arc<AppState>) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let r = singbox_stop_root(app).await;
+        state.running.store(false, Ordering::Relaxed);
+        return r;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let r = singbox_stop_admin(app);
+        state.running.store(false, Ordering::Relaxed);
+        return r;
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        kill_singbox(state);
+        Ok(())
+    }
+}
+
+async fn start_profile_for_check(
+    app: AppHandle,
+    state: &Arc<AppState>,
+    cfg: &ProxyConfig,
+) -> Result<(), String> {
+    let settings = { state.settings.lock().unwrap().clone() };
+    let cfg_path = write_singbox_config_for_profile_check(&app, &cfg.config, &settings)?;
+    let cfg_path_str = cfg_path.to_string_lossy().to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        singbox_start_root(cfg_path_str, None).await?;
+
+        if !wait_for_clash_api(5000).await {
+            state.running.store(false, Ordering::Relaxed);
+            return Err("sing-box запустился, но Clash API на 127.0.0.1:9090 не ответил".into());
+        }
+
+        state.running.store(true, Ordering::Relaxed);
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        singbox_start_admin(app, cfg_path_str)?;
+
+        if !wait_singbox_running_windows(2500) {
+            state.running.store(false, Ordering::Relaxed);
+            return Err("sing-box не запустился (process not found)".into());
+        }
+
+        if !wait_for_clash_api(5000).await {
+            state.running.store(false, Ordering::Relaxed);
+            return Err("sing-box запустился, но Clash API на 127.0.0.1:9090 не ответил".into());
+        }
+
+        state.running.store(true, Ordering::Relaxed);
+        return Ok(());
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let _ = app;
+        let _ = cfg_path_str;
+        Err("Проверка профилей пока поддержана только на Windows и macOS".to_string())
+    }
+}
+
+#[tauri::command]
+async fn check_profiles(app: AppHandle, state: SharedState<'_>) -> Result<Vec<ProfileCheckResult>, String> {
+    let _check_guard = try_begin_profile_check()?;
+    let state_arc = state.inner().clone();
+    let configs = { state_arc.configs.lock().unwrap().clone() };
+
+    if configs.is_empty() {
+        return Err("Профили не загружены. Нажмите «Обновить конфиги» в настройках.".to_string());
+    }
+
+    let was_running = is_platform_running(&state_arc);
+    let previous_selected = { state_arc.settings.lock().unwrap().selected_config.clone() };
+    let total = configs.len();
+    let mut results = Vec::with_capacity(total);
+
+    // Перед проверкой всегда останавливаем текущий sing-box. Дальше каждый профиль
+    // запускается, проверяется и полностью останавливается до перехода к следующему.
+    let _ = stop_platform_for_profile_check(app.clone(), &state_arc).await;
+    sleep(Duration::from_millis(300));
+
+    for (idx, cfg) in configs.iter().enumerate() {
+        let index = idx + 1;
+
+        emit_profile_check_event(&app, ProfileCheckEvent {
+            name: cfg.name.clone(),
+            index,
+            total,
+            status: "checking".to_string(),
+            ip: None,
+            error: None,
+        });
+
+        // Дополнительная остановка перед каждым профилем защищает от ситуации,
+        // когда предыдущий запуск не успел завершиться или был поднят извне.
+        let _ = stop_platform_for_profile_check(app.clone(), &state_arc).await;
+        sleep(Duration::from_millis(300));
+
+        {
+            let mut s = state_arc.settings.lock().unwrap();
+            s.selected_config = Some(cfg.name.clone());
+            let _ = s.save(&state_arc.settings_path);
+        }
+
+        let check = async {
+            start_profile_for_check(app.clone(), &state_arc, cfg).await?;
+            sleep(Duration::from_millis(2500));
+            fetch_ipinfo_ip_through_full_vpn().await
+        }
+        .await;
+
+        let result = match check {
+            Ok(ip) => ProfileCheckResult {
+                name: cfg.name.clone(),
+                ok: true,
+                ip: Some(ip),
+                error: None,
+            },
+            Err(e) => ProfileCheckResult {
+                name: cfg.name.clone(),
+                ok: false,
+                ip: None,
+                error: Some(e),
+            },
+        };
+
+        emit_profile_check_event(&app, ProfileCheckEvent {
+            name: result.name.clone(),
+            index,
+            total,
+            status: if result.ok { "success" } else { "fail" }.to_string(),
+            ip: result.ip.clone(),
+            error: result.error.clone(),
+        });
+
+        results.push(result);
+
+        // Строго завершаем текущий профиль перед следующим.
+        let _ = stop_platform_for_profile_check(app.clone(), &state_arc).await;
+        sleep(Duration::from_millis(500));
+    }
+
+    {
+        let mut s = state_arc.settings.lock().unwrap();
+        s.selected_config = previous_selected.clone();
+        let _ = s.save(&state_arc.settings_path);
+    }
+
+    if was_running {
+        if let Some(name) = previous_selected {
+            if let Some(cfg) = configs.iter().find(|c| c.name == name) {
+                let _ = start_profile_for_check(app.clone(), &state_arc, cfg).await;
+            }
+        }
+    } else {
+        state_arc.running.store(false, Ordering::Relaxed);
+    }
+
+    emit_profile_check_event(&app, ProfileCheckEvent {
+        name: String::new(),
+        index: total,
+        total,
+        status: "finished".to_string(),
+        ip: None,
+        error: None,
+    });
+
+    Ok(results)
 }
 
 #[tauri::command]
