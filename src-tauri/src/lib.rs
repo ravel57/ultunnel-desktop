@@ -1,4 +1,5 @@
 mod api;
+mod browser_api;
 #[cfg(target_os = "macos")]
 mod macos_smjobbless;
 mod settings;
@@ -23,6 +24,8 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -36,6 +39,7 @@ use tauri::menu::Menu;
 use tauri::menu::MenuItem;
 use tauri::tray::TrayIconBuilder;
 use tauri::AppHandle;
+use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
 use tauri::WindowEvent;
@@ -44,6 +48,7 @@ use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::process::CommandChild;
+use tauri_plugin_shell::ShellExt;
 use tauri_plugin_single_instance::init as single_instance_init;
 use tracing::error;
 use tracing::info;
@@ -60,6 +65,8 @@ const HELPER_DST: &str = "/Library/PrivilegedHelperTools/ru.ravel.ultunnel-macos
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 static EXITING: AtomicBool = AtomicBool::new(false);
+static PROFILE_CHECKING: AtomicBool = AtomicBool::new(false);
+
 
 pub struct AppState {
     pub settings_path: PathBuf,
@@ -375,10 +382,18 @@ async fn singbox_stop_root(app: AppHandle) -> Result<(), String> {
         let _ = macos_smjobbless::helper_stop_singbox(HELPER_LABEL)?;
         let _ = Command::new("/usr/bin/pkill")
             .args(["-x", "sing-box"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
-        let _ = Command::new("/usr/bin/killall").args(["sing-box"]).status();
+        let _ = Command::new("/usr/bin/killall")
+            .args(["sing-box"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         let _ = Command::new("/usr/bin/pkill")
             .args(["-f", "sing-box"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
         Ok(())
     }
@@ -450,6 +465,100 @@ fn singbox_stop_admin(_app: AppHandle) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(target_os = "linux")]
+fn relaunch_as_root_if_needed() -> Result<(), String> {
+    if is_root() {
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("Не удалось получить путь к exe: {e}"))?;
+
+    let display = std::env::var("DISPLAY").unwrap_or_default();
+    let wayland_display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+    let xauthority = std::env::var("XAUTHORITY").unwrap_or_default();
+    let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+    let dbus_session_bus_address = std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_default();
+
+    let mut cmd = std::process::Command::new("pkexec");
+
+    cmd.arg("env");
+
+    if !display.is_empty() {
+        cmd.arg(format!("DISPLAY={display}"));
+    }
+
+    if !wayland_display.is_empty() {
+        cmd.arg(format!("WAYLAND_DISPLAY={wayland_display}"));
+    }
+
+    if !xauthority.is_empty() {
+        cmd.arg(format!("XAUTHORITY={xauthority}"));
+    }
+
+    if !xdg_runtime_dir.is_empty() {
+        cmd.arg(format!("XDG_RUNTIME_DIR={xdg_runtime_dir}"));
+    }
+
+    if !dbus_session_bus_address.is_empty() {
+        cmd.arg(format!("DBUS_SESSION_BUS_ADDRESS={dbus_session_bus_address}"));
+    }
+
+    cmd.arg(exe);
+
+    cmd.spawn()
+        .map_err(|e| format!("Не удалось перезапустить приложение через pkexec: {e}"))?;
+
+    std::process::exit(0);
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+async fn singbox_start(
+    app: AppHandle,
+    state: SharedState<'_>,
+    cfg_path: String,
+) -> Result<(), String> {
+    {
+        let guard = state.singbox.lock().unwrap();
+        if guard.is_some() {
+            return Ok(());
+        }
+    }
+
+    let sidecar = app
+        .shell()
+        .sidecar("sing-box")
+        .map_err(|e| format!("Не удалось найти sidecar sing-box: {e}"))?;
+
+    let (_rx, child) = sidecar
+        .args(["run", "-c", cfg_path.as_str()])
+        .spawn()
+        .map_err(|e| format!("Не удалось запустить sing-box: {e}"))?;
+
+    *state.singbox.lock().unwrap() = Some(child);
+
+    if !wait_for_clash_api(5000).await {
+        kill_singbox(state.inner());
+        return Err("sing-box запустился, но Clash API на 127.0.0.1:9090 не ответил".into());
+    }
+
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+async fn singbox_stop(
+    _app: AppHandle,
+    state: SharedState<'_>,
+) -> Result<(), String> {
+    kill_singbox(state.inner());
+    Ok(())
+}
+
 #[tauri::command]
 async fn load_configs(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {
     let access_key = {
@@ -502,6 +611,11 @@ async fn load_configs(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, St
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    if let Err(e) = relaunch_as_root_if_needed() {
+        eprintln!("{e}");
+    }
+
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
@@ -583,6 +697,7 @@ pub fn run() {
             }
 
             app.manage(state.clone());
+            browser_api::spawn_browser_api(state.clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -619,6 +734,7 @@ pub fn run() {
             get_autostart_status,
             set_autostart_enabled,
             get_dashboard_stats,
+            check_profiles,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -842,7 +958,7 @@ async fn singbox_start_platform(app: AppHandle, state: SharedState<'_>) -> Resul
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        let r = singbox_start(app, state).await;
+        let r = singbox_start(app, state.clone(), cfg_path_str).await;
         if r.is_ok() {
             state.running.store(true, Ordering::Relaxed);
         }
@@ -871,7 +987,7 @@ async fn singbox_stop_platform(
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        let r = singbox_stop(app, state).await;
+        let r = singbox_stop(app, state.clone()).await;
         state.running.store(false, Ordering::Relaxed);
         return r;
     }
@@ -1066,25 +1182,55 @@ fn list_running_apps() -> Result<Vec<RunningApp>, String> {
         out.dedup_by(|a, b| a.pid == b.pid);
         Ok(out)
     }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let mut sys = System::new_all();
+        sys.refresh_processes(ProcessesToUpdate::All, false);
+
+        let mut out: Vec<RunningApp> = sys
+            .processes()
+            .iter()
+            .map(|(pid, proc_)| RunningApp {
+                pid: pid.to_string().parse::<u32>().unwrap_or(0),
+                name: proc_.name().to_os_string().into_string().unwrap_or_default(),
+                path: proc_.exe().map(|p| p.display().to_string()),
+                title: None,
+            })
+            .collect();
+
+        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out.dedup_by(|a, b| a.pid == b.pid);
+
+        Ok(out)
+    }
 }
 
 #[cfg(target_os = "windows")]
 fn list_running_apps_windows() -> Result<Vec<RunningApp>, String> {
-    // Берём только процессы с окном (MainWindowHandle != 0),
-    // чтобы было "как диспетчер задач" (активные приложения), а не сервисы/фон.
-    // Path может быть пустой для системных процессов — их отфильтруем.
     let ps = r#"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
 Get-Process |
   Where-Object { $_.MainWindowHandle -ne 0 -and $_.Path -and $_.Path -ne "" } |
   Select-Object Id,ProcessName,Path,MainWindowTitle |
   Sort-Object ProcessName |
-  ConvertTo-Json -Depth 3
+  ConvertTo-Json -Depth 3 -Compress
 "#;
 
-    let mut cmd = Command::new("powershell");
+    let mut cmd = Command::new("powershell.exe");
     cmd.creation_flags(CREATE_NO_WINDOW);
+
     let out = cmd
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps])
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ps,
+        ])
         .output()
         .map_err(|e| e.to_string())?;
 
@@ -1092,14 +1238,19 @@ Get-Process |
         return Err(String::from_utf8_lossy(&out.stderr).to_string());
     }
 
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stdout = String::from_utf8(out.stdout)
+        .map_err(|e| format!("PowerShell вернул не UTF-8: {e}"))?
+        .trim()
+        .trim_start_matches('\u{feff}')
+        .to_string();
+
     if stdout.is_empty() || stdout == "null" {
         return Ok(vec![]);
     }
 
-    let v: Value = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
+    let v: Value = serde_json::from_str(&stdout)
+        .map_err(|e| format!("Не удалось разобрать JSON процессов: {e}; stdout={stdout}"))?;
 
-    // ConvertTo-Json отдаёт либо объект (если 1 элемент), либо массив
     let arr = match v {
         Value::Array(a) => a,
         Value::Object(_) => vec![v],
@@ -1113,22 +1264,24 @@ Get-Process |
             .get("ProcessName")
             .and_then(|x| x.as_str())
             .unwrap_or("")
+            .trim()
             .to_string();
         let path = item
             .get("Path")
             .and_then(|x| x.as_str())
-            .map(|s| s.to_string());
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let title = item
             .get("MainWindowTitle")
             .and_then(|x| x.as_str())
-            .map(|s| s.to_string())
-            .filter(|s| !s.trim().is_empty());
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         if pname.is_empty() {
             continue;
         }
 
-        // Get-Process даёт имя без .exe — приведём к виду, который ожидает UI
         let name = if pname.to_ascii_lowercase().ends_with(".exe") {
             pname
         } else {
@@ -1279,6 +1432,106 @@ fn apply_socks5_inbound(cfg: &mut serde_json::Value, enabled: bool, proxy_outbou
             }),
         );
     }
+}
+
+fn collect_tun_inbound_tags_for_profile_check(cfg: &serde_json::Value) -> Vec<String> {
+    cfg.get("inbounds")
+        .and_then(|v| v.as_array())
+        .map(|inbounds| {
+            inbounds
+                .iter()
+                .filter(|ib| ib.get("type").and_then(|v| v.as_str()) == Some("tun"))
+                .filter_map(|ib| ib.get("tag").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn configure_full_vpn_profile_check(cfg: &mut serde_json::Value, tun_tags: &[String]) {
+    let root = match cfg.as_object_mut() {
+        Some(v) => v,
+        None => return,
+    };
+
+    // Проверка профилей должна поднимать именно полноценный TUN/VPN,
+    // а не локальный proxy-inbound. Поэтому для временного конфига проверки
+    // отключаем split-routing/process-routing и делаем proxy финальным outbound
+    // для всего системного трафика, попадающего в TUN.
+    if !root.contains_key("route") || !root.get("route").unwrap().is_object() {
+        root.insert("route".into(), Value::Object(Map::new()));
+    }
+
+    let route = root
+        .get_mut("route")
+        .and_then(|v| v.as_object_mut())
+        .unwrap();
+
+    route.insert("final".to_string(), Value::String("proxy".to_string()));
+    route.insert("auto_detect_interface".to_string(), Value::Bool(true));
+    route.remove("find_process");
+
+    // Убираем правила, которые могли увести часть трафика напрямую по process_name,
+    // process_path, domain_suffix и т.п. Для проверки нужен чистый full-tunnel:
+    // DNS перехватывается, остальной трафик идет в route.final = proxy.
+    route.insert(
+        "rules".to_string(),
+        Value::Array(vec![
+            json!({ "inbound": tun_tags, "action": "sniff" }),
+            json!({ "protocol": ["dns"], "action": "hijack-dns" }),
+        ]),
+    );
+}
+
+fn ensure_tun_inbound_exists_for_profile_check(cfg: &serde_json::Value) -> Result<Vec<String>, String> {
+    let tun_tags = collect_tun_inbound_tags_for_profile_check(cfg);
+
+    if !tun_tags.is_empty() {
+        Ok(tun_tags)
+    } else {
+        Err("В конфиге нет TUN inbound, поэтому полноценный VPN для проверки поднять нельзя".to_string())
+    }
+}
+
+fn write_singbox_config_for_profile_check(
+    app: &AppHandle,
+    cfg: &Value,
+    settings: &LocalSettings,
+) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let path: PathBuf = dir.join("singbox-profile-check.json");
+    let mut v = cfg.clone();
+
+    normalize_primary_outbound_tag(&mut v);
+    let tun_tags = ensure_tun_inbound_exists_for_profile_check(&v)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = settings;
+        patch_config_for_macos(&mut v);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut full_tunnel_split = settings.split_routing.clone();
+        full_tunnel_split.enabled = false;
+        patch_config_for_windows(&mut v, &full_tunnel_split);
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let _ = settings;
+    }
+
+    configure_full_vpn_profile_check(&mut v, &tun_tags);
+    ensure_clash_api(&mut v);
+
+    let json = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())?;
+
+    Ok(path)
 }
 
 #[tauri::command]
@@ -1498,6 +1751,47 @@ struct DashboardStats {
     core_version: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileCheckResult {
+    name: String,
+    ok: bool,
+    ip: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileCheckEvent {
+    name: String,
+    index: usize,
+    total: usize,
+    status: String,
+    ip: Option<String>,
+    error: Option<String>,
+}
+
+struct ProfileCheckGuard;
+
+impl Drop for ProfileCheckGuard {
+    fn drop(&mut self) {
+        PROFILE_CHECKING.store(false, Ordering::SeqCst);
+    }
+}
+
+fn try_begin_profile_check() -> Result<ProfileCheckGuard, String> {
+    PROFILE_CHECKING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map(|_| ProfileCheckGuard)
+        .map_err(|_| "Проверка профилей уже выполняется".to_string())
+}
+
+fn emit_profile_check_event(app: &AppHandle, event: ProfileCheckEvent) {
+    if let Err(e) = app.emit("profile-check-progress", event) {
+        warn!("Не удалось отправить событие profile-check-progress: {}", e);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct TrafficResponse {
     up: i64,
@@ -1512,6 +1806,234 @@ struct ConnectionsResponse {
 #[derive(Debug, Deserialize)]
 struct VersionResponse {
     version: Option<String>,
+}
+
+
+async fn fetch_ipinfo_ip_through_full_vpn() -> Result<String, String> {
+    // Здесь намеренно НЕ используется reqwest::Proxy.
+    // Проверка должна идти как обычный системный трафик приложения после поднятия TUN,
+    // чтобы IP был получен через полноценный VPN-маршрут, а не через локальный порт.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .get("https://ipinfo.io/ip")
+        .header(reqwest::header::USER_AGENT, "ultunnel-desktop")
+        .send()
+        .await
+        .map_err(|e| format!("ipinfo request through full VPN failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("ipinfo through full VPN returned HTTP {}", resp.status()));
+    }
+
+    let ip = resp
+        .text()
+        .await
+        .map_err(|e| format!("ipinfo response through full VPN read failed: {}", e))?
+        .trim()
+        .to_string();
+
+    if ip.is_empty() {
+        Err("ipinfo through full VPN returned empty IP".to_string())
+    } else {
+        Ok(ip)
+    }
+}
+
+
+fn is_platform_running(state: &Arc<AppState>) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        return is_singbox_running_windows();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        state.running.load(Ordering::Relaxed)
+    }
+}
+
+async fn stop_platform_for_profile_check(app: AppHandle, state: &Arc<AppState>) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let r = singbox_stop_root(app).await;
+        state.running.store(false, Ordering::Relaxed);
+        return r;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let r = singbox_stop_admin(app);
+        state.running.store(false, Ordering::Relaxed);
+        return r;
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        kill_singbox(state);
+        Ok(())
+    }
+}
+
+async fn start_profile_for_check(
+    app: AppHandle,
+    state: &Arc<AppState>,
+    cfg: &ProxyConfig,
+) -> Result<(), String> {
+    let settings = { state.settings.lock().unwrap().clone() };
+    let cfg_path = write_singbox_config_for_profile_check(&app, &cfg.config, &settings)?;
+    let cfg_path_str = cfg_path.to_string_lossy().to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        singbox_start_root(cfg_path_str, None).await?;
+
+        if !wait_for_clash_api(5000).await {
+            state.running.store(false, Ordering::Relaxed);
+            return Err("sing-box запустился, но Clash API на 127.0.0.1:9090 не ответил".into());
+        }
+
+        state.running.store(true, Ordering::Relaxed);
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        singbox_start_admin(app, cfg_path_str)?;
+
+        if !wait_singbox_running_windows(2500) {
+            state.running.store(false, Ordering::Relaxed);
+            return Err("sing-box не запустился (process not found)".into());
+        }
+
+        if !wait_for_clash_api(5000).await {
+            state.running.store(false, Ordering::Relaxed);
+            return Err("sing-box запустился, но Clash API на 127.0.0.1:9090 не ответил".into());
+        }
+
+        state.running.store(true, Ordering::Relaxed);
+        return Ok(());
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let _ = app;
+        let _ = cfg_path_str;
+        Err("Проверка профилей пока поддержана только на Windows и macOS".to_string())
+    }
+}
+
+#[tauri::command]
+async fn check_profiles(app: AppHandle, state: SharedState<'_>) -> Result<Vec<ProfileCheckResult>, String> {
+    let _check_guard = try_begin_profile_check()?;
+    let state_arc = state.inner().clone();
+    let configs = { state_arc.configs.lock().unwrap().clone() };
+
+    if configs.is_empty() {
+        return Err("Профили не загружены. Нажмите «Обновить конфиги» в настройках.".to_string());
+    }
+
+    let was_running = is_platform_running(&state_arc);
+    let previous_selected = { state_arc.settings.lock().unwrap().selected_config.clone() };
+    let total = configs.len();
+    let mut results = Vec::with_capacity(total);
+
+    // Перед проверкой всегда останавливаем текущий sing-box. Дальше каждый профиль
+    // запускается, проверяется и полностью останавливается до перехода к следующему.
+    let _ = stop_platform_for_profile_check(app.clone(), &state_arc).await;
+    sleep(Duration::from_millis(300));
+
+    for (idx, cfg) in configs.iter().enumerate() {
+        let index = idx + 1;
+
+        emit_profile_check_event(&app, ProfileCheckEvent {
+            name: cfg.name.clone(),
+            index,
+            total,
+            status: "checking".to_string(),
+            ip: None,
+            error: None,
+        });
+
+        // Дополнительная остановка перед каждым профилем защищает от ситуации,
+        // когда предыдущий запуск не успел завершиться или был поднят извне.
+        let _ = stop_platform_for_profile_check(app.clone(), &state_arc).await;
+        sleep(Duration::from_millis(300));
+
+        {
+            let mut s = state_arc.settings.lock().unwrap();
+            s.selected_config = Some(cfg.name.clone());
+            let _ = s.save(&state_arc.settings_path);
+        }
+
+        let check = async {
+            start_profile_for_check(app.clone(), &state_arc, cfg).await?;
+            sleep(Duration::from_millis(2500));
+            fetch_ipinfo_ip_through_full_vpn().await
+        }
+        .await;
+
+        let result = match check {
+            Ok(ip) => ProfileCheckResult {
+                name: cfg.name.clone(),
+                ok: true,
+                ip: Some(ip),
+                error: None,
+            },
+            Err(e) => ProfileCheckResult {
+                name: cfg.name.clone(),
+                ok: false,
+                ip: None,
+                error: Some(e),
+            },
+        };
+
+        emit_profile_check_event(&app, ProfileCheckEvent {
+            name: result.name.clone(),
+            index,
+            total,
+            status: if result.ok { "success" } else { "fail" }.to_string(),
+            ip: result.ip.clone(),
+            error: result.error.clone(),
+        });
+
+        results.push(result);
+
+        // Строго завершаем текущий профиль перед следующим.
+        let _ = stop_platform_for_profile_check(app.clone(), &state_arc).await;
+        sleep(Duration::from_millis(500));
+    }
+
+    {
+        let mut s = state_arc.settings.lock().unwrap();
+        s.selected_config = previous_selected.clone();
+        let _ = s.save(&state_arc.settings_path);
+    }
+
+    if was_running {
+        if let Some(name) = previous_selected {
+            if let Some(cfg) = configs.iter().find(|c| c.name == name) {
+                let _ = start_profile_for_check(app.clone(), &state_arc, cfg).await;
+            }
+        }
+    } else {
+        state_arc.running.store(false, Ordering::Relaxed);
+    }
+
+    emit_profile_check_event(&app, ProfileCheckEvent {
+        name: String::new(),
+        index: total,
+        total,
+        status: "finished".to_string(),
+        ip: None,
+        error: None,
+    });
+
+    Ok(results)
 }
 
 #[tauri::command]

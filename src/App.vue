@@ -44,31 +44,47 @@
 			</div>
 
 			<div class="card">
-				<div class="card-title">Профиль</div>
+				<div class="row-between profileCheckHead">
+					<div>
+						<div class="card-title">Профиль</div>
+					</div>
+					<button class="btn btn-ghost" @click="checkProfiles" :disabled="checkingProfiles || loadingProfiles || !profiles.length">
+						{{ checkingProfiles ? `Проверка ${profileCheckProgress} / ${profileCheckTotal || profiles.length}` : 'Проверить профили' }}
+					</button>
+				</div>
 
 				<div v-if="loadingProfiles" class="muted">Загрузка…</div>
 
-				<div v-else class="list">
+				<div v-else class="list profileList">
 					<label
 						v-for="name in profiles"
 						:key="name"
-						class="row"
+						class="row profileRow"
+						:class="profileRowClass(name)"
 					>
-						<input
-							class="radio"
-							type="radio"
-							name="profile"
-							:value="name"
-							v-model="selectedProfile"
-							@change="onSelectProfile(name)"
-						/>
-						<span class="row-text">{{ name }}</span>
+						<div class="profileRowMain">
+							<input
+								class="radio"
+								type="radio"
+								name="profile"
+								:value="name"
+								v-model="selectedProfile"
+								@change="onSelectProfile(name)"
+							/>
+							<span class="row-text">{{ name }}</span>
+						</div>
+
+						<div v-if="shouldShowProfileCheckState(name)" class="profileCheckInline">
+							<span class="checkBadge">{{ checkStatusLabel(getProfileCheckResult(name)) }}</span>
+							<span class="checkValue">{{ checkResultText(getProfileCheckResult(name)) }}</span>
+						</div>
 					</label>
 
 					<div v-if="!profiles.length" class="muted">
 						Профили не загружены. Нажмите «Обновить конфиги» в настройках.
 					</div>
 				</div>
+
 			</div>
 		</div>
 
@@ -261,6 +277,7 @@
 <script lang="ts">
 import {defineComponent, h} from 'vue'
 import {invoke} from '@tauri-apps/api/core'
+import {listen, type UnlistenFn} from '@tauri-apps/api/event'
 
 type SplitListKey = "bypassApps" | "proxyApps" | "bypassDomains" | "proxyDomains";
 type InputKey = "newBypassApp" | "newProxyApp" | "newBypassDomain" | "newProxyDomain";
@@ -294,6 +311,25 @@ type RunningApp = {
 	name: string
 	path?: string | null
 	title?: string | null
+}
+
+type ProfileCheckStatus = 'pending' | 'checking' | 'success' | 'fail'
+
+type ProfileCheckResult = {
+	name: string
+	ok: boolean
+	ip?: string | null
+	error?: string | null
+	status?: ProfileCheckStatus
+}
+
+type ProfileCheckProgressEvent = {
+	name: string
+	index: number
+	total: number
+	status: 'checking' | 'success' | 'fail' | 'finished'
+	ip?: string | null
+	error?: string | null
 }
 
 function defaultSplit(): SplitRoutingSettings {
@@ -427,6 +463,12 @@ export default defineComponent({
 
 		loadingProfiles: false,
 		loadingConfigs: false,
+		checkingProfiles: false,
+		profileCheckCurrent: '' as string,
+		profileCheckProgress: 0,
+		profileCheckTotal: 0,
+		profileCheckResults: [] as ProfileCheckResult[],
+		profileCheckUnlisten: null as UnlistenFn | null,
 		errorText: '' as string,
 
 		// settings UI (пока просто UI, можно потом сохранять)
@@ -458,6 +500,7 @@ export default defineComponent({
 	}),
 
 	async created() {
+		await this.registerProfileCheckEvents()
 		await this.bootstrap()
 		await this.loadSplit()
 		await this.loadSocks5Inbound()
@@ -467,9 +510,90 @@ export default defineComponent({
 
 	beforeUnmount() {
 		this.stopStatsPolling()
+		if (this.profileCheckUnlisten) {
+			this.profileCheckUnlisten()
+			this.profileCheckUnlisten = null
+		}
 	},
 
 	methods: {
+		async registerProfileCheckEvents() {
+			if (this.profileCheckUnlisten) return
+
+			this.profileCheckUnlisten = await listen<ProfileCheckProgressEvent>('profile-check-progress', (event) => {
+				const payload = event.payload
+				if (!payload) return
+
+				this.profileCheckTotal = Number(payload.total || this.profileCheckTotal || this.profiles.length || 0)
+				this.profileCheckProgress = Number(payload.index || this.profileCheckProgress || 0)
+
+				if (payload.status === 'finished') {
+					this.profileCheckCurrent = ''
+					this.profileCheckProgress = this.profileCheckTotal
+					return
+				}
+
+				this.profileCheckCurrent = payload.name
+				this.upsertProfileCheckResult({
+					name: payload.name,
+					ok: payload.status === 'success',
+					ip: payload.ip ?? null,
+					error: payload.error ?? null,
+					status: payload.status === 'checking' ? 'checking' : (payload.status === 'success' ? 'success' : 'fail'),
+				})
+			})
+		},
+
+		upsertProfileCheckResult(result: ProfileCheckResult) {
+			const idx = this.profileCheckResults.findIndex(x => x.name === result.name)
+			if (idx >= 0) {
+				this.profileCheckResults.splice(idx, 1, {...this.profileCheckResults[idx], ...result})
+			} else {
+				this.profileCheckResults.push(result)
+			}
+		},
+
+		getProfileCheckResult(name: string): ProfileCheckResult {
+			return this.profileCheckResults.find(x => x.name === name) || {
+				name,
+				ok: false,
+				ip: null,
+				error: null,
+				status: 'pending',
+			}
+		},
+
+		shouldShowProfileCheckState(name: string): boolean {
+			return this.checkingProfiles || this.profileCheckResults.some(x => x.name === name)
+		},
+
+		profileRowClass(name: string) {
+			return this.checkRowClass(this.getProfileCheckResult(name))
+		},
+
+		checkRowClass(r: ProfileCheckResult) {
+			return {
+				ok: r.status === 'success' || (!r.status && r.ok),
+				fail: r.status === 'fail' || (!r.status && !r.ok),
+				checking: r.status === 'checking',
+				pending: r.status === 'pending',
+			}
+		},
+
+		checkStatusLabel(r: ProfileCheckResult): string {
+			if (r.status === 'checking') return 'Проверяется'
+			if (r.status === 'pending') return 'Ожидает'
+			if (r.status === 'success' || (!r.status && r.ok)) return 'OK'
+			return 'Ошибка'
+		},
+
+		checkResultText(r: ProfileCheckResult): string {
+			if (r.status === 'pending') return 'Ожидает очереди'
+			if (r.status === 'checking') return 'Запуск и проверка IP…'
+			if (r.status === 'success' || (!r.status && r.ok)) return r.ip || 'Успешно'
+			return r.error || 'Ошибка проверки'
+		},
+
 		async bootstrap() {
 			try {
 				this.errorText = ''
@@ -564,6 +688,43 @@ export default defineComponent({
 				this.errorText = String(e)
 			} finally {
 				this.loadingConfigs = false
+			}
+		},
+
+		async checkProfiles() {
+			try {
+				this.errorText = ''
+				this.checkingProfiles = true
+				this.profileCheckCurrent = ''
+				this.profileCheckProgress = 0
+				this.profileCheckTotal = this.profiles.length
+				this.profileCheckResults = this.profiles.map(name => ({
+					name,
+					ok: false,
+					ip: null,
+					error: null,
+					status: 'pending' as ProfileCheckStatus,
+				}))
+
+				const wasRunning = this.isRunning
+				this.isRunning = false
+				this.trafficHistory = []
+
+				const results = await invoke<ProfileCheckResult[]>('check_profiles')
+				if (Array.isArray(results)) {
+					this.profileCheckResults = results.map(r => ({
+						...r,
+						status: r.ok ? 'success' : 'fail',
+					}))
+				}
+				this.profileCheckCurrent = ''
+				this.profileCheckProgress = this.profileCheckTotal || this.profileCheckResults.length
+				this.isRunning = await invoke<boolean>('get_state').catch(() => wasRunning)
+			} catch (e: any) {
+				this.errorText = String(e)
+				this.isRunning = await invoke<boolean>('get_state').catch(() => false)
+			} finally {
+				this.checkingProfiles = false
 			}
 		},
 
@@ -781,6 +942,12 @@ export default defineComponent({
 	},
 
 	computed: {
+		profileCheckPercent(): number {
+			const total = this.profileCheckTotal || this.profiles.length || 0
+			if (!total) return 0
+			return Math.min(100, Math.round((this.profileCheckProgress / total) * 100))
+		},
+
 		filteredRunningApps(): RunningApp[] {
 			const q = (this.appsSearch || "").trim().toLowerCase()
 			if (!q) return this.runningApps
@@ -880,6 +1047,67 @@ export default defineComponent({
 	font-size: 16px;
 	line-height: 1.4;
 	color: #edf1f7;
+}
+
+.profileList {
+	gap: 10px;
+}
+
+.profileRow {
+	justify-content: space-between;
+	padding: 12px 14px;
+	border-radius: 14px;
+	background: transparent;
+	border: 1px solid transparent;
+	transition: background 0.18s ease, border-color 0.18s ease;
+}
+
+.profileRow.ok {
+	border-color: rgba(34, 197, 94, 0.32);
+	background: rgba(34, 197, 94, 0.10);
+}
+
+.profileRow.fail {
+	border-color: rgba(239, 68, 68, 0.34);
+	background: rgba(239, 68, 68, 0.12);
+}
+
+.profileRow.checking {
+	border-color: rgba(96, 165, 250, 0.36);
+	background: rgba(96, 165, 250, 0.12);
+}
+
+.profileRow.pending {
+	border-color: rgba(255, 255, 255, 0.10);
+	background: rgba(255, 255, 255, 0.04);
+}
+
+.profileRowMain {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	min-width: 0;
+}
+
+.profileRowMain .row-text {
+	font-weight: 700;
+	word-break: break-word;
+}
+
+.profileCheckInline {
+	display: inline-flex;
+	align-items: center;
+	justify-content: flex-end;
+	gap: 10px;
+	min-width: 0;
+	max-width: 48%;
+}
+
+.profileCheckInline .checkValue {
+	text-align: right;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 .radio {
@@ -1075,6 +1303,118 @@ input[type="checkbox"] {
 	height: 1px;
 	background: rgba(255, 255, 255, 0.08);
 	margin-top: 6px;
+}
+
+
+.profileCheckHead {
+	align-items: flex-start;
+	margin-bottom: 14px;
+}
+
+.profileCheckStatus {
+	margin-top: 14px;
+	padding: 14px;
+	border-radius: 16px;
+	background: #202534;
+	border: 1px solid rgba(96, 165, 250, 0.24);
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.currentProfile {
+	font-size: 17px;
+	font-weight: 800;
+	color: #ffffff;
+	word-break: break-word;
+}
+
+.progressText {
+	font-size: 13px;
+	color: rgba(226, 232, 240, 0.72);
+}
+
+.progressBar {
+	height: 9px;
+	border-radius: 999px;
+	background: rgba(255, 255, 255, 0.08);
+	overflow: hidden;
+}
+
+.progressFill {
+	height: 100%;
+	border-radius: inherit;
+	background: linear-gradient(90deg, #60a5fa 0%, #8b5cf6 100%);
+	transition: width 0.2s ease;
+}
+
+.profileCheckResults {
+	margin-top: 14px;
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+
+.checkRow {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(150px, auto);
+	gap: 12px;
+	align-items: center;
+	padding: 12px 14px;
+	border-radius: 14px;
+	background: #202534;
+	border: 1px solid rgba(255, 255, 255, 0.10);
+}
+
+.checkRow.ok {
+	border-color: rgba(34, 197, 94, 0.32);
+	background: rgba(34, 197, 94, 0.10);
+}
+
+.checkRow.fail {
+	border-color: rgba(239, 68, 68, 0.34);
+	background: rgba(239, 68, 68, 0.12);
+}
+
+.checkRow.checking {
+	border-color: rgba(96, 165, 250, 0.36);
+	background: rgba(96, 165, 250, 0.12);
+}
+
+.checkRow.pending {
+	border-color: rgba(255, 255, 255, 0.10);
+	background: rgba(255, 255, 255, 0.04);
+}
+
+.checkName {
+	font-weight: 800;
+	color: #ffffff;
+	word-break: break-word;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.checkBadge {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	padding: 4px 8px;
+	border-radius: 999px;
+	background: rgba(255, 255, 255, 0.08);
+	color: rgba(226, 232, 240, 0.86);
+	font-size: 12px;
+	font-weight: 800;
+	line-height: 1;
+}
+
+.checkValue {
+	color: rgba(226, 232, 240, 0.86);
+	font-size: 14px;
+	line-height: 1.35;
+	word-break: break-word;
+	text-align: right;
 }
 
 /* Stats */
@@ -1367,6 +1707,29 @@ input[type="checkbox"] {
 	.row-between {
 		flex-direction: column;
 		align-items: stretch;
+	}
+
+	.profileRow {
+		align-items: flex-start;
+		flex-direction: column;
+	}
+
+	.profileCheckInline {
+		max-width: 100%;
+		justify-content: flex-start;
+	}
+
+	.profileCheckInline .checkValue {
+		text-align: left;
+		white-space: normal;
+	}
+
+	.checkRow {
+		grid-template-columns: 1fr;
+	}
+
+	.checkValue {
+		text-align: left;
 	}
 
 	.modalOverlay {

@@ -32,6 +32,9 @@ tracing-appender = "0.2"
 tauri-plugin-single-instance = "2"
 futures-util = "0.3"
 tauri-plugin-autostart = "2"
+axum = "0.7"
+tokio = { version = "1", features = ["net", "rt", "macros"] }
+tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }
 
 [lints.rust]
