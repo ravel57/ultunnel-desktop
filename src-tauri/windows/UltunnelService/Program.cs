@@ -7,12 +7,26 @@ using UltunnelService;
 internal static class Program {
 	private const string ServiceName = "UltunnelService";
 
+	private static readonly string BaseDir = Path.Combine(
+		Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+		"Ultunnel"
+	);
+
+	private static readonly string InstallerLogFile = Path.Combine(BaseDir, "installer.log");
+	private static readonly string CommandFile = Path.Combine(BaseDir, "command.json");
+	private static readonly string StatusFile = Path.Combine(BaseDir, "status.json");
+
 	static int Main(string[] args) {
+		Directory.CreateDirectory(BaseDir);
+
 		string mode = args.FirstOrDefault()?.ToLowerInvariant() ?? "";
 
 		try {
+			LogInstaller("Program started. Args: " + string.Join(" ", args));
+
 			switch (mode) {
 				case "--service":
+					LogInstaller("Starting in Windows Service mode");
 					ServiceBase.Run(new UltunnelWindowsService());
 					return 0;
 
@@ -43,119 +57,113 @@ internal static class Program {
 					return 0;
 
 				default:
-					// return RunClientMode();
+					if (!IsAdministrator()) {
+						LogInstaller("Not administrator. Relaunching self as admin with --install");
+						RelaunchSelfAsAdmin("--install");
+						return 0;
+					}
 					RequireAdministrator();
 					InstallService();
 					return 0;
 			}
 		}
 		catch (Exception ex) {
+			LogInstaller("Fatal error: " + ex);
 			Console.Error.WriteLine(ex);
 			return 1;
 		}
 	}
 
-	private static int RunClientMode() {
-		if (!ServiceExists(ServiceName)) {
-			RelaunchSelfAsAdmin("--install");
-			return 0;
-		}
-
-		// Здесь можно запускать GUI
-		// Например WinForms / WPF / Avalonia / Tauri-host / консольное меню
-		Console.WriteLine("Client mode");
-		Console.WriteLine("Service installed");
-		Console.WriteLine("1 - start");
-		Console.WriteLine("2 - stop");
-		Console.WriteLine("3 - status");
-
-		string? key = Console.ReadLine();
-		switch (key) {
-			case "1":
-				SendCommand("start");
-				break;
-			case "2":
-				SendCommand("stop");
-				break;
-			case "3":
-				PrintStatus();
-				break;
-		}
-
-		return 0;
-	}
-
 	private static void InstallService() {
-		string installDir = Path.Combine(
-			Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-			"Ultunnel"
-		);
+		LogInstaller("InstallService started");
 
-		Directory.CreateDirectory(installDir);
-		
+		Directory.CreateDirectory(BaseDir);
+
 		string currentDir = AppContext.BaseDirectory;
+		string currentExe = Environment.ProcessPath
+			?? throw new InvalidOperationException("Cannot get current exe path");
 
-		string targetExe = Path.Combine(installDir, "UltunnelService.exe");
-		CopyDirectory(currentDir, installDir);
+		string targetExe = Path.Combine(BaseDir, Path.GetFileName(currentExe));
+
+		LogInstaller("Current dir: " + currentDir);
+		LogInstaller("Current exe: " + currentExe);
+		LogInstaller("Install dir: " + BaseDir);
+		LogInstaller("Target exe: " + targetExe);
+
+		if (!SameDirectory(currentDir, BaseDir)) {
+			CopyDirectory(currentDir, BaseDir);
+			LogInstaller("Files copied to install directory");
+		}
+		else {
+			LogInstaller("Current directory is already install directory. Copy skipped");
+		}
+
+		if (!File.Exists(targetExe)) {
+			throw new FileNotFoundException("Target service exe was not found after copy", targetExe);
+		}
 
 		if (ServiceExists(ServiceName)) {
+			LogInstaller("Service already exists. Stopping and deleting old service");
 			StopServiceIfRunning();
 			DeleteService();
+			WaitUntilServiceDeleted(ServiceName, TimeSpan.FromSeconds(10));
 		}
 
-		RunSc($"create {ServiceName} binPath= \"\\\"{targetExe}\\\" --service\" start= auto");
+		string binPath = $"\"{targetExe}\" --service";
+
+		RunSc($"create {ServiceName} binPath= \"{binPath}\" start= auto");
 		RunSc($"description {ServiceName} \"Ultunnel background service\"");
+
+		LogInstaller("Starting service");
 		RunSc($"start {ServiceName}", ignoreExitCode: true);
 
 		Console.WriteLine("Service installed");
+		LogInstaller("Service installed");
 	}
 
 	private static void UninstallService() {
-		if (!ServiceExists(ServiceName))
+		LogInstaller("UninstallService started");
+
+		if (!ServiceExists(ServiceName)) {
+			LogInstaller("Service does not exist. Nothing to uninstall");
+			Console.WriteLine("Service not found");
 			return;
+		}
 
 		StopServiceIfRunning();
 		DeleteService();
+
 		Console.WriteLine("Service removed");
+		LogInstaller("Service removed");
 	}
 
 	private static void SendCommand(string cmd) {
-		string baseDir = Path.Combine(
-			Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-			"Ultunnel"
-		);
-
-		Directory.CreateDirectory(baseDir);
-
-		string commandFile = Path.Combine(baseDir, "command.json");
+		Directory.CreateDirectory(BaseDir);
 
 		var payload = new {
-			cmd = cmd,
-			timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+			Id = Guid.NewGuid().ToString("N"),
+			Cmd = cmd,
+			Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
 		};
 
 		string json = JsonSerializer.Serialize(payload, new JsonSerializerOptions {
 			WriteIndented = true
 		});
 
-		File.WriteAllText(commandFile, json);
+		File.WriteAllText(CommandFile, json);
+
 		Console.WriteLine($"Command sent: {cmd}");
+		LogInstaller($"Command sent: {cmd}, file: {CommandFile}");
 	}
 
 	private static void PrintStatus() {
-		string baseDir = Path.Combine(
-			Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-			"Ultunnel"
-		);
-
-		string statusFile = Path.Combine(baseDir, "status.json");
-
-		if (!File.Exists(statusFile)) {
+		if (!File.Exists(StatusFile)) {
 			Console.WriteLine("status.json not found");
+			LogInstaller("status.json not found: " + StatusFile);
 			return;
 		}
 
-		Console.WriteLine(File.ReadAllText(statusFile));
+		Console.WriteLine(File.ReadAllText(StatusFile));
 	}
 
 	private static void RequireAdministrator() {
@@ -184,33 +192,52 @@ internal static class Program {
 	}
 
 	private static bool ServiceExists(string serviceName) {
-		var psi = new ProcessStartInfo {
-			FileName = "sc.exe",
-			Arguments = $"query {serviceName}",
-			RedirectStandardOutput = true,
-			RedirectStandardError = true,
-			UseShellExecute = false,
-			CreateNoWindow = true
-		};
-
-		using var process = Process.Start(psi)!;
-		process.WaitForExit();
-		return process.ExitCode == 0;
+		var result = RunProcess("sc.exe", $"query {serviceName}", ignoreExitCode: true);
+		return result.ExitCode == 0;
 	}
 
 	private static void StopServiceIfRunning() {
+		LogInstaller("Stopping service if running");
 		RunSc($"stop {ServiceName}", ignoreExitCode: true);
 		Thread.Sleep(2000);
 	}
 
 	private static void DeleteService() {
+		LogInstaller("Deleting service");
 		RunSc($"delete {ServiceName}", ignoreExitCode: true);
 		Thread.Sleep(1500);
 	}
 
+	private static void WaitUntilServiceDeleted(string serviceName, TimeSpan timeout) {
+		DateTime deadline = DateTime.UtcNow.Add(timeout);
+
+		while (DateTime.UtcNow < deadline) {
+			if (!ServiceExists(serviceName)) {
+				LogInstaller("Service deleted");
+				return;
+			}
+
+			Thread.Sleep(500);
+		}
+
+		LogInstaller("Service still exists after delete timeout");
+	}
+
 	private static void RunSc(string arguments, bool ignoreExitCode = false) {
+		var result = RunProcess("sc.exe", arguments, ignoreExitCode);
+
+		if (!ignoreExitCode && result.ExitCode != 0) {
+			throw new InvalidOperationException(
+				$"sc.exe {arguments} failed\nOUT:\n{result.Stdout}\nERR:\n{result.Stderr}"
+			);
+		}
+	}
+
+	private static ProcessResult RunProcess(string fileName, string arguments, bool ignoreExitCode = false) {
+		LogInstaller($"Run process: {fileName} {arguments}");
+
 		var psi = new ProcessStartInfo {
-			FileName = "sc.exe",
+			FileName = fileName,
 			Arguments = arguments,
 			RedirectStandardOutput = true,
 			RedirectStandardError = true,
@@ -219,33 +246,78 @@ internal static class Program {
 		};
 
 		using var process = Process.Start(psi)!;
+
 		string stdout = process.StandardOutput.ReadToEnd();
 		string stderr = process.StandardError.ReadToEnd();
+
 		process.WaitForExit();
 
-		if (!ignoreExitCode && process.ExitCode != 0) {
-			throw new InvalidOperationException(
-				$"sc.exe {arguments} failed\nOUT:\n{stdout}\nERR:\n{stderr}"
-			);
+		LogInstaller($"Exit code: {process.ExitCode}");
+		if (!string.IsNullOrWhiteSpace(stdout)) {
+			LogInstaller("STDOUT: " + stdout.Trim());
 		}
+		if (!string.IsNullOrWhiteSpace(stderr)) {
+			LogInstaller("STDERR: " + stderr.Trim());
+		}
+
+		return new ProcessResult(process.ExitCode, stdout, stderr);
 	}
 
-	static void CopyDirectory(string sourceDir, string destinationDir, bool recursive = true) {
+	private static void CopyDirectory(string sourceDir, string destinationDir, bool recursive = true) {
 		var dir = new DirectoryInfo(sourceDir);
+
 		if (!dir.Exists) {
 			throw new DirectoryNotFoundException($"Исходная папка не найдена: {sourceDir}");
 		}
+
 		Directory.CreateDirectory(destinationDir);
+
 		foreach (FileInfo file in dir.GetFiles()) {
 			string targetFilePath = Path.Combine(destinationDir, file.Name);
+
+			if (Path.GetFullPath(file.FullName).Equals(Path.GetFullPath(targetFilePath), StringComparison.OrdinalIgnoreCase)) {
+				continue;
+			}
+
 			file.CopyTo(targetFilePath, true);
+			LogInstaller($"Copied file: {file.FullName} -> {targetFilePath}");
 		}
+
 		if (!recursive) {
 			return;
 		}
+
 		foreach (DirectoryInfo subDir in dir.GetDirectories()) {
 			string newDestinationDir = Path.Combine(destinationDir, subDir.Name);
+
+			if (Path.GetFullPath(subDir.FullName).Equals(Path.GetFullPath(newDestinationDir), StringComparison.OrdinalIgnoreCase)) {
+				continue;
+			}
+
 			CopyDirectory(subDir.FullName, newDestinationDir);
 		}
 	}
+
+	private static bool SameDirectory(string a, string b) {
+		string fullA = Path.GetFullPath(a).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+		string fullB = Path.GetFullPath(b).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+		return string.Equals(fullA, fullB, StringComparison.OrdinalIgnoreCase);
+	}
+
+	private static void LogInstaller(string message) {
+		try {
+			Directory.CreateDirectory(BaseDir);
+
+			File.AppendAllText(
+				InstallerLogFile,
+				$"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}{Environment.NewLine}"
+			);
+		}
+		catch {
+			// Нельзя падать из-за ошибки логирования.
+		}
+	}
+
+	private sealed record ProcessResult(int ExitCode, string Stdout, string Stderr);
 }
