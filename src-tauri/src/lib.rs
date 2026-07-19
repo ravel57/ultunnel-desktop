@@ -757,6 +757,7 @@ fn save_configs_to_file(path: &Path, configs: &[ProxyConfig]) -> Result<(), Stri
     fs::write(path, json).map_err(|e| e.to_string())
 }
 
+#[cfg(target_os = "macos")]
 fn kill_singbox(state: &Arc<AppState>) {
     if let Some(child) = state.singbox.lock().unwrap().take() {
         let _ = child.kill();
@@ -989,52 +990,61 @@ fn set_split_routing(state: SharedState, split: SplitRoutingSettings) -> Result<
     s.save(&state.settings_path)
 }
 
+fn push_process_name_variants(names: &mut Vec<String>, name: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+
+    names.push(name.to_string());
+
+    #[cfg(target_os = "windows")]
+    {
+        let low = name.to_ascii_lowercase();
+        if low != name {
+            names.push(low.clone());
+        }
+
+        if low.ends_with(".exe") {
+            let without_exe = low.trim_end_matches(".exe").to_string();
+            if !without_exe.is_empty() {
+                names.push(without_exe);
+            }
+        } else if !low.contains('.') {
+            names.push(format!("{low}.exe"));
+        }
+    }
+}
+
 fn split_process_tokens(list: &[String]) -> (Vec<String>, Vec<String>) {
     let mut names: Vec<String> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
 
     for s in list {
-        let t = s.trim();
-        if t.is_empty() {
+        let token = s.trim();
+        if token.is_empty() {
             continue;
         }
 
-        // Путь
-        if t.contains('/') || t.contains('\\') {
-            paths.push(t.to_string());
+        if token.contains('/') || token.contains('\\') {
+            paths.push(token.to_string());
 
             #[cfg(target_os = "windows")]
             {
-                let low = t.to_ascii_lowercase();
-                if low != t {
+                let low = token.to_ascii_lowercase();
+                if low != token {
                     paths.push(low);
                 }
             }
-
-            continue;
-        }
-
-        // Имя процесса
-        names.push(t.to_string());
-
-        #[cfg(target_os = "windows")]
-        {
-            let low = t.to_ascii_lowercase();
-            if low != t {
-                names.push(low.clone());
-            }
-
-            // добавить вариант с .exe и без .exe
-            if low.ends_with(".exe") {
-                let no = low.trim_end_matches(".exe").to_string();
-                if !no.is_empty() {
-                    names.push(no);
-                }
-            } else if !low.contains('.') {
-                names.push(format!("{low}.exe"));
-            }
+        } else {
+            push_process_name_variants(&mut names, token);
         }
     }
+
+    names.sort_unstable();
+    names.dedup();
+    paths.sort_unstable();
+    paths.dedup();
 
     (names, paths)
 }

@@ -237,7 +237,15 @@
 				<button class="btn btn-ghost" @click="closeAppsPicker">✕</button>
 			</div>
 
-			<div class="row">
+			<div class="appsMatchMode">
+				<label class="setting-label" for="apps-match-mode">Сопоставлять приложение по</label>
+				<select id="apps-match-mode" class="select" v-model="appsMatchMode">
+					<option value="path">Абсолютному пути</option>
+					<option value="name">Имени исполняемого файла</option>
+				</select>
+			</div>
+
+			<div class="row appsSearchRow">
 				<input class="input" v-model="appsSearch" placeholder="Поиск: имя / путь / заголовок окна…"/>
 				<button class="btn" @click="refreshRunningApps" :disabled="appsLoading">
 					{{ appsLoading ? 'Обновление…' : 'Обновить' }}
@@ -251,6 +259,7 @@
 					v-for="a in filteredRunningApps"
 					:key="a.pid + ':' + (a.path || a.name)"
 					class="appRow"
+					:disabled="appsMatchMode === 'path' && !a.path"
 					@click="addRunningApp(a)"
 				>
 					<div class="appMain">
@@ -266,8 +275,12 @@
 			</div>
 
 			<div class="modalHint muted">
-				При выборе добавляется <b>путь</b> (process_path). Если путь недоступен — добавится имя процесса
-				(process_name).
+				<template v-if="appsMatchMode === 'path'">
+					Будет создано правило <b>process_path</b> с абсолютным путём к исполняемому файлу.
+				</template>
+				<template v-else>
+					Будет создано правило <b>process_name</b> с именем исполняемого файла.
+				</template>
 			</div>
 		</div>
 	</div>
@@ -312,6 +325,8 @@ type RunningApp = {
 	path?: string | null
 	title?: string | null
 }
+
+type AppMatchMode = 'path' | 'name'
 
 type ProfileCheckStatus = 'pending' | 'checking' | 'success' | 'fail'
 
@@ -490,6 +505,7 @@ export default defineComponent({
 		appsModalOpen: false,
 		appsModalTarget: null as null | SplitListKey, // куда добавляем: bypassApps или proxyApps
 		appsSearch: "" as string,
+		appsMatchMode: "path" as AppMatchMode,
 
 		socks5Inbound: false,
 
@@ -816,10 +832,9 @@ export default defineComponent({
 		addRunningApp(app: RunningApp) {
 			if (!this.appsModalTarget) return
 
-			// предпочтительно добавляем PATH (самое надёжное для sing-box: process_path)
-			let value =
-				(app.path && String(app.path).trim().length ? String(app.path).trim() : "") ||
-				(app.name || "").trim()
+			const value = this.appsMatchMode === "path"
+				? (app.path || "").trim()
+				: (app.name || "").trim()
 
 			if (!value) return
 
@@ -1620,6 +1635,22 @@ input[type="checkbox"] {
 	color: #ffffff;
 }
 
+.appsMatchMode {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 16px;
+	padding: 16px 20px 0;
+}
+
+.appsMatchMode .select {
+	min-width: 250px;
+}
+
+.appsSearchRow {
+	padding: 16px 20px 0;
+}
+
 .appsList {
 	padding: 16px;
 	display: flex;
@@ -1645,6 +1676,16 @@ input[type="checkbox"] {
 .appRow:hover {
 	background: #242c3b;
 	border-color: rgba(96, 165, 250, 0.28);
+}
+
+.appRow:disabled {
+	opacity: 0.45;
+	cursor: not-allowed;
+}
+
+.appRow:disabled:hover {
+	background: #1e2431;
+	border-color: rgba(255, 255, 255, 0.10);
 }
 
 .appMain {
@@ -1689,6 +1730,17 @@ input[type="checkbox"] {
 
 	.title {
 		font-size: 24px;
+	}
+
+	.appsMatchMode {
+		align-items: stretch;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.appsMatchMode .select {
+		width: 100%;
+		min-width: 0;
 	}
 
 	.card {
