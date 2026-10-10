@@ -42,9 +42,12 @@ pub fn install_helper(label: &str) -> Result<(), String> {
 
 	let ok = unsafe { smjobbless_install(c_label.as_ptr(), &mut err) } != 0;
 	if ok {
+		tracing::info!("SMJobBless: helper {} установлен", label);
 		Ok(())
 	} else {
-		Err(take_err(err).unwrap_or_else(|| "SMJobBless failed (no error)".to_string()))
+		let msg = take_err(err).unwrap_or_else(|| "SMJobBless failed (no error)".to_string());
+		tracing::error!("SMJobBless: установка helper {} не удалась: {}", label, msg);
+		Err(msg)
 	}
 }
 
@@ -68,9 +71,12 @@ pub fn helper_start_singbox(label: &str, singbox_path: &Path, config_path: &Path
 	} != 0;
 
 	if ok {
+		tracing::info!("Helper: startSingBox выполнен успешно");
 		Ok(())
 	} else {
-		Err(take_err(err).unwrap_or_else(|| "helper startSingBox failed (no error)".to_string()))
+		let msg = take_err(err).unwrap_or_else(|| "helper startSingBox failed (no error)".to_string());
+		tracing::error!("Helper: startSingBox вернул ошибку: {}", msg);
+		Err(msg)
 	}
 }
 
@@ -80,9 +86,12 @@ pub fn helper_stop_singbox(label: &str) -> Result<(), String> {
 	let ok = unsafe { smhelper_stop_singbox(c_label.as_ptr(), &mut err) } != 0;
 
 	if ok {
+		tracing::info!("Helper: stopSingBox выполнен успешно");
 		Ok(())
 	} else {
-		Err(take_err(err).unwrap_or_else(|| "helper stopSingBox failed (no error)".to_string()))
+		let msg = take_err(err).unwrap_or_else(|| "helper stopSingBox failed (no error)".to_string());
+		tracing::error!("Helper: stopSingBox вернул ошибку: {}", msg);
+		Err(msg)
 	}
 }
 
@@ -102,8 +111,11 @@ pub fn helper_set_autostart(label: &str, enabled: bool, app_path: &Path, uid: i3
 	} != 0;
 
 	if ok {
+		tracing::info!("Helper: setAutostart({}) выполнен успешно", enabled);
 		Ok(())
 	} else {
-		Err(take_err(err).unwrap_or_else(|| "helper setAutostart failed (no error)".to_string()))
+		let msg = take_err(err).unwrap_or_else(|| "helper setAutostart failed (no error)".to_string());
+		tracing::error!("Helper: setAutostart({}) вернул ошибку: {}", enabled, msg);
+		Err(msg)
 	}
 }

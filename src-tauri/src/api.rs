@@ -7,35 +7,54 @@ pub struct ProxyConfig {
     pub config: Value, // sing-box JSON
 }
 
+const CONFIGS_ENDPOINT: &str = "https://admin.ultunnel.ru/api/v1/get-users-proxy-servers-singbox";
+
 pub async fn fetch_raw_configs(secret_key: &str) -> Result<Value, String> {
     let url = reqwest::Url::parse_with_params(
-        "https://admin.ultunnel.ru/api/v1/get-users-proxy-servers-singbox",
+        CONFIGS_ENDPOINT,
         &[("secretKey", secret_key), ("platform", "desktop")],
     )
-    .map_err(|e| format!("url parse error: {e}"))?;
+    .map_err(|e| {
+        let msg = format!("url parse error: {e}");
+        tracing::error!("{}", msg);
+        msg
+    })?;
 
     let client = reqwest::Client::new();
 
-    tracing::info!("Запрос конфигов: {}", url);
+    // В URL есть secretKey, поэтому ни его, ни полный адрес в лог/ошибки не попадают.
+    tracing::info!("Запрос конфигов: {}", CONFIGS_ENDPOINT);
+    let started = std::time::Instant::now();
 
-    let resp = client
-        .get(url.clone())
-        .send()
-        .await
-        .map_err(|e| {
-            let msg = format!("request error for {url}: {e:?}");
-            tracing::error!("{}", msg);
-            msg
-        })?;
+    let resp = client.get(url).send().await.map_err(|e| {
+        let kind = if e.is_timeout() {
+            "таймаут"
+        } else if e.is_connect() {
+            "ошибка соединения"
+        } else {
+            "ошибка запроса"
+        };
+        let e = e.without_url();
+        let msg = format!("{kind} при обращении к {CONFIGS_ENDPOINT}: {e:?}");
+        tracing::error!("{}", msg);
+        msg
+    })?;
+
+    tracing::info!(
+        "Ответ API конфигов: HTTP {} за {} мс",
+        resp.status(),
+        started.elapsed().as_millis()
+    );
 
     if !resp.status().is_success() {
-        let msg = format!("HTTP {} for {}", resp.status(), url);
+        let msg = format!("HTTP {} for {}", resp.status(), CONFIGS_ENDPOINT);
         tracing::error!("{}", msg);
         return Err(msg);
     }
 
     let json = resp.json::<Value>().await.map_err(|e| {
-        let msg = format!("json parse error for {url}: {e:?}");
+        let e = e.without_url();
+        let msg = format!("json parse error for {CONFIGS_ENDPOINT}: {e:?}");
         tracing::error!("{}", msg);
         msg
     })?;
@@ -64,6 +83,7 @@ pub fn normalize_configs(raw: Value) -> Result<Vec<ProxyConfig>, String> {
         if data.is_array() {
             data.clone()
         } else {
+            tracing::error!("Ответ API конфигов: поле data не является массивом");
             return Err("Поле data не является массивом".into());
         }
     } else if looks_like_singbox_config(&raw) {
@@ -72,6 +92,7 @@ pub fn normalize_configs(raw: Value) -> Result<Vec<ProxyConfig>, String> {
             config: raw,
         }]);
     } else {
+        tracing::error!("Неожиданный формат ответа API конфигов (нет ни массива, ни data, ни sing-box конфига)");
         return Err("Неожиданный формат ответа API".into());
     };
 
@@ -79,35 +100,47 @@ pub fn normalize_configs(raw: Value) -> Result<Vec<ProxyConfig>, String> {
 
     let mut out = Vec::<ProxyConfig>::new();
 
-    for (_idx, item) in arr.iter().enumerate() {
+    for (idx, item) in arr.iter().enumerate() {
         if let Some(configs) = item.get("configs").and_then(|x| x.as_array()) {
             let server = item
                 .get("server")
                 .and_then(|x| x.as_str())
                 .unwrap_or("null");
-            for (_j, c) in configs.iter().enumerate() {
-                if let Some(cfg_v) = parse_config_value(c) {
-                    let protocol = cfg_v
-                        .get("outbounds")
-                        .and_then(|x| x.as_array())
-                        .and_then(|arr| arr.get(0))
-                        .and_then(|obj| obj.get("type"))
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("unknown");
-                    let name = format!("{}-{}", server, protocol);
-                    out.push(ProxyConfig {
-                        name,
-                        config: cfg_v.clone(),
-                    });
-                }
+            for (j, c) in configs.iter().enumerate() {
+                let Some(cfg_v) = parse_config_value(c) else {
+                    tracing::warn!(
+                        "Конфиг пропущен: сервер {:?} (элемент {}), конфиг #{} не является корректным JSON",
+                        server, idx, j
+                    );
+                    continue;
+                };
+                let protocol = cfg_v
+                    .get("outbounds")
+                    .and_then(|x| x.as_array())
+                    .and_then(|arr| arr.get(0))
+                    .and_then(|obj| obj.get("type"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("unknown");
+                let name = format!("{}-{}", server, protocol);
+                out.push(ProxyConfig {
+                    name,
+                    config: cfg_v.clone(),
+                });
             }
             continue;
         }
+        tracing::warn!("Элемент ответа API #{} пропущен: нет поля configs", idx);
     }
 
     if out.is_empty() {
+        tracing::error!("API вернул пустой список конфигов (элементов в ответе: {})", arr.len());
         return Err("API вернул пустой список конфигов".into());
     }
 
+    tracing::info!(
+        "Конфиги разобраны: профилей={} (элементов в ответе: {})",
+        out.len(),
+        arr.len()
+    );
     Ok(out)
 }

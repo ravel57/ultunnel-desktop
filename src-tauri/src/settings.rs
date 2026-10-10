@@ -85,10 +85,20 @@ impl Default for LocalSettings {
 
 impl LocalSettings {
     pub fn load(path: &Path) -> Self {
-        if let Ok(s) = fs::read_to_string(path) {
-            if let Ok(v) = serde_json::from_str::<Self>(&s) {
-                return v;
-            }
+        match fs::read_to_string(path) {
+            Ok(s) => match serde_json::from_str::<Self>(&s) {
+                Ok(v) => return v,
+                Err(e) => tracing::error!(
+                    "Не удалось разобрать настройки {}: {} — используются настройки по умолчанию",
+                    path.display(),
+                    e
+                ),
+            },
+            Err(e) => tracing::info!(
+                "Файл настроек {} не прочитан ({}), используются настройки по умолчанию",
+                path.display(),
+                e
+            ),
         }
         Self::default()
     }

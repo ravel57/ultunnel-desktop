@@ -9,5 +9,6 @@ SIGN_IDENTITY="Developer ID Application: Petr Lomakin (ASMHMRKL3K)" \
 NOTARY=1 \
 NOTARY_PROFILE="notary" \
 SCHEME="UltunnelPrivilegedHelper" \
-bash src-tauri/macos/bundle/package-macos.sh "/Users/petr/dev/RustroverProjects/ultunnel-desktop/src-tauri/target/release/bundle/macos/ultunnel-desktop.app"
+bash src-tauri/macos/bundle/package-macos.sh \
+  --target <aarch64-apple-darwin/x86_64-apple-darwin>
 ```

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 
 const BROWSER_API_BIND: &str = "127.0.0.1:18491";
 const BROWSER_API_TOKEN: &str = "ultunnel-local-secret";
@@ -192,6 +193,7 @@ async fn get_state_handler(
     Query(query): Query<StateQuery>,
 ) -> Response {
     if !is_authorized(&headers) {
+        warn!("Browser API: /state — неавторизованный запрос");
         return err(StatusCode::UNAUTHORIZED, "unauthorized");
     }
 
@@ -224,11 +226,13 @@ async fn toggle_domain_handler(
 	Json(body): Json<ToggleDomainRequest>,
 ) -> Response {
 	if !is_authorized(&headers) {
+		warn!("Browser API: /domain/toggle — неавторизованный запрос");
 		return err(StatusCode::UNAUTHORIZED, "unauthorized");
 	}
 
 	let domain = normalize_domain(&body.domain);
 	if domain.is_empty() {
+		warn!("Browser API: /domain/toggle — пустой domain");
 		return err(StatusCode::BAD_REQUEST, "domain is required");
 	}
 
@@ -237,6 +241,7 @@ async fn toggle_domain_handler(
 	let domains = normalize_domains(&domains);
 
 	if domains.is_empty() {
+		warn!("Browser API: /domain/toggle — список доменов пуст");
 		return err(StatusCode::BAD_REQUEST, "domains are required");
 	}
 
@@ -258,6 +263,12 @@ async fn toggle_domain_handler(
 		}
 	}
 
+	info!(
+		"Browser API: домены {} в списке проксирования: {:?} (split_routing и socks5 включены; применится при следующем запуске VPN)",
+		if body.enabled { "добавлены" } else { "удалены" },
+		domains
+	);
+
 	ok(serde_json::json!({
         "domains": domains,
         "count": domains.len()
@@ -270,9 +281,11 @@ async fn tunnel_all_handler(
 	Json(body): Json<TunnelAllRequest>,
 ) -> Response {
 	if !is_authorized(&headers) {
+		warn!("Browser API: /tunnel-all — неавторизованный запрос");
 		return err(StatusCode::UNAUTHORIZED, "unauthorized");
 	}
 
+	info!("Browser API: туннелирование всего трафика = {}", body.enabled);
 	{
 		let mut settings = api.app_state.settings.lock().unwrap();
 
