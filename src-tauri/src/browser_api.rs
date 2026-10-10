@@ -1,5 +1,5 @@
-use crate::AppState;
-use crate::SplitRoutingSettings;
+use crate::state::AppState;
+use crate::settings::SplitRoutingSettings;
 use axum::extract::Query;
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -206,7 +206,7 @@ async fn get_state_handler(
 
     let resp = BrowserStateResponse {
         #[cfg(target_os = "windows")]
-        running: crate::is_singbox_running_windows(),
+        running: crate::singbox::process::is_singbox_running_windows(),
         #[cfg(not(target_os = "windows"))]
         running: api.app_state.running.load(std::sync::atomic::Ordering::Relaxed),
 

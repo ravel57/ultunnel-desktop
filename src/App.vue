@@ -194,6 +194,31 @@
 				</div>
 			</div>
 
+			<!-- DNS -->
+			<div class="card">
+				<div class="card-title">DNS серверы</div>
+				<div class="muted" style="margin-bottom:8px">
+					Если список пуст, используется DNS из профиля. Первый сервер — основной.
+					Форматы: <b>1.1.1.1</b>, <b>tls://dns.google</b>, <b>https://cloudflare-dns.com/dns-query</b>,
+					<b>tcp://8.8.8.8</b>.
+				</div>
+				<div class="row">
+					<input
+						class="input"
+						v-model="newDnsServer"
+						placeholder="например: 1.1.1.1 или tls://dns.google"
+						@keyup.enter="addDnsServer"
+					/>
+					<button class="btn" @click="addDnsServer">Добавить</button>
+				</div>
+				<div class="chips">
+					<span class="chip" v-for="d in dnsServers" :key="d">
+						{{ d }} <button class="chipX" @click="removeDnsServer(d)">×</button>
+					</span>
+				</div>
+				<div v-if="dnsError" class="error">{{ dnsError }}</div>
+			</div>
+
 		</div>
 
 		<!-- Floating Start/Stop button (like play button) -->
@@ -509,6 +534,10 @@ export default defineComponent({
 
 		socks5Inbound: false,
 
+		dnsServers: [] as string[],
+		newDnsServer: "" as string,
+		dnsError: "" as string,
+
 		autostartEnabled: false,
 		autostartOsEnabled: false,
 		autostartLoading: false,
@@ -520,6 +549,7 @@ export default defineComponent({
 		await this.bootstrap()
 		await this.loadSplit()
 		await this.loadSocks5Inbound()
+		await this.loadDnsServers()
 		await this.loadAutostart()
 		this.startStatsPolling()
 	},
@@ -842,6 +872,48 @@ export default defineComponent({
 				this.split[this.appsModalTarget].push(value)
 				void this.saveSplit()
 			}
+		},
+
+		async loadDnsServers(): Promise<void> {
+			try {
+				this.dnsServers = await invoke<string[]>("get_dns_servers")
+			} catch (e: any) {
+				this.dnsError = String(e)
+			}
+		},
+
+		async saveDnsServers(next: string[]): Promise<boolean> {
+			this.dnsError = ""
+			try {
+				await invoke("set_dns_servers", {servers: next})
+			} catch (e: any) {
+				this.dnsError = String(e)
+				return false
+			}
+			this.dnsServers = next
+
+			// применить сразу
+			if (this.isRunning) {
+				await invoke("singbox_stop_platform")
+				await invoke("singbox_start_platform")
+				this.isRunning = true
+			}
+			return true
+		},
+
+		async addDnsServer(): Promise<void> {
+			const v = (this.newDnsServer || "").trim()
+			if (!v || this.dnsServers.includes(v)) {
+				this.newDnsServer = ""
+				return
+			}
+			if (await this.saveDnsServers([...this.dnsServers, v])) {
+				this.newDnsServer = ""
+			}
+		},
+
+		async removeDnsServer(item: string): Promise<void> {
+			await this.saveDnsServers(this.dnsServers.filter((x) => x !== item))
 		},
 
 		async loadSocks5Inbound(): Promise<void> {

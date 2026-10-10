@@ -28,6 +28,7 @@ pub struct SplitRoutingSettings {
     pub direct_outbound: String,
 }
 
+fn default_dns_servers() -> Vec<String> { vec!["1.1.1.1".into()] }
 fn default_proxy_outbound() -> String { "proxy".into() }
 fn default_direct_outbound() -> String { "direct".into() }
 
@@ -67,6 +68,12 @@ pub struct LocalSettings {
 
 	#[serde(default)]
 	pub autostart_enabled: bool,
+
+	/// Пользовательские DNS-серверы; первый — основной. Пусто = DNS из профиля.
+	/// По умолчанию (первый запуск / поля нет в config.json) — 1.1.1.1; явно
+	/// очищенный пользователем список сохраняется как [] и остаётся пустым.
+	#[serde(default = "default_dns_servers")]
+	pub dns_servers: Vec<String>,
 }
 
 impl Default for LocalSettings {
@@ -79,6 +86,7 @@ impl Default for LocalSettings {
             macos_process_tunnel_enabled: false,
             macos_tunneled_processes: vec![],
 			autostart_enabled: false,
+			dns_servers: default_dns_servers(),
         }
     }
 }
@@ -109,5 +117,33 @@ impl LocalSettings {
         }
         let s = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         fs::write(path, s).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dns_servers_roundtrip_through_config_json() {
+        let path = std::env::temp_dir().join("ultunnel-settings-roundtrip.json");
+        let mut s = LocalSettings::default();
+        s.dns_servers = vec!["1.1.1.1".into(), "tls://dns.google".into()];
+        s.save(&path).unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"dns_servers\""), "{raw}");
+        assert_eq!(LocalSettings::load(&path).dns_servers, s.dns_servers);
+
+        // первый запуск / старый config.json без поля: DNS по умолчанию 1.1.1.1
+        fs::write(&path, r#"{"macos_process_tunnel_enabled":false,"macos_tunneled_processes":[]}"#).unwrap();
+        assert_eq!(LocalSettings::load(&path).dns_servers, vec!["1.1.1.1".to_string()]);
+        assert_eq!(LocalSettings::default().dns_servers, vec!["1.1.1.1".to_string()]);
+
+        // пользователь удалил всё — пустой список сохраняется и не возвращается к умолчанию
+        s.dns_servers = vec![];
+        s.save(&path).unwrap();
+        assert!(LocalSettings::load(&path).dns_servers.is_empty());
+        let _ = fs::remove_file(&path);
     }
 }
