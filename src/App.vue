@@ -21,20 +21,6 @@
 						<div class="statValue">{{ formatSpeed(dashboard.upBps) }}</div>
 					</div>
 
-					<div class="statItem">
-						<div class="statLabel">Соединения</div>
-						<div class="statValue">{{ dashboard.activeConnections }}</div>
-					</div>
-
-					<div class="statItem">
-						<div class="statLabel">Память</div>
-						<div class="statValue">{{ dashboard.memoryMb }} MB</div>
-					</div>
-
-					<div class="statItem">
-						<div class="statLabel">Версия core</div>
-						<div class="statValue">{{ dashboard.coreVersion }}</div>
-					</div>
 				</div>
 			</div>
 
@@ -138,6 +124,11 @@
 
 				<div class="muted" style="margin-top:6px" v-if="autostartNote">
 					{{ autostartNote }}
+				</div>
+
+				<div class="row-between" style="margin-top:12px">
+					<span>Версия ядра</span>
+					<span class="muted">{{ dashboard.coreVersion }}</span>
 				</div>
 			</div>
 
@@ -329,8 +320,6 @@ type TrafficPoint = {
 type DashboardStats = {
 	upBps: number
 	downBps: number
-	activeConnections: number
-	memoryMb: number
 	coreVersion?: string | null
 }
 
@@ -488,8 +477,6 @@ export default defineComponent({
 		dashboard: {
 			upBps: 0,
 			downBps: 0,
-			activeConnections: 0,
-			memoryMb: 0,
 			coreVersion: '—',
 		} as Required<DashboardStats>,
 
@@ -973,8 +960,6 @@ export default defineComponent({
 
 				this.dashboard.upBps = Number(stats?.upBps || 0)
 				this.dashboard.downBps = Number(stats?.downBps || 0)
-				this.dashboard.activeConnections = Number(stats?.activeConnections || 0)
-				this.dashboard.memoryMb = Number(stats?.memoryMb || 0)
 				this.dashboard.coreVersion = stats?.coreVersion || '—'
 
 				const now = new Date().toLocaleTimeString()
@@ -992,8 +977,6 @@ export default defineComponent({
 				this.errorText = 'Статистика недоступна: ' + String(e)
 				this.dashboard.upBps = 0
 				this.dashboard.downBps = 0
-				this.dashboard.activeConnections = 0
-				this.dashboard.memoryMb = 0
 				this.dashboard.coreVersion = '—'
 			}
 		},

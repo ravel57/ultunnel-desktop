@@ -10,7 +10,7 @@ set -euo pipefail
 #   ./build-helper.sh ru.ravel.ultunnel-macos.helper
 #
 # Environment:
-#   SCHEME (default: Helper)
+#   SCHEME (default: UltunnelPrivilegedHelper)
 #   CONFIGURATION (default: Release)
 #   ARCH (optional; e.g. x86_64, arm64, or "arm64 x86_64")
 #   SIGN_IDENTITY (optional; signing is done later by package-macos.sh anyway)
@@ -37,7 +37,7 @@ if [[ ! -d "$PROJECT" ]]; then
   exit 1
 fi
 
-SCHEME="${SCHEME:-Helper}"
+SCHEME="${SCHEME:-UltunnelPrivilegedHelper}"
 CONFIGURATION="${CONFIGURATION:-Release}"
 ARCH="${ARCH:-}"
 

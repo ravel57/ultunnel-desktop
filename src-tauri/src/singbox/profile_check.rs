@@ -4,6 +4,9 @@
 
 use std::fs;
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
@@ -35,6 +38,9 @@ use crate::singbox::diagnostics::first_line;
 use crate::singbox::process::is_singbox_running_windows;
 use crate::singbox::diagnostics::prepare_singbox_log_file;
 use crate::singbox::diagnostics::singbox_extra_args;
+use crate::singbox::singbox_exe_path;
+#[cfg(windows)]
+use crate::singbox::CREATE_NO_WINDOW;
 #[cfg(target_os = "windows")]
 use crate::singbox::process::singbox_start_admin;
 use crate::singbox::process::singbox_start_root;
@@ -150,11 +156,84 @@ fn extract_profile_outbound(cfg: &ProxyConfig, tag: &str) -> Result<Value, Strin
         .cloned()
         .ok_or_else(|| format!("у профиля {:?} нет outbounds[0]", cfg.name))?;
 
+    // Legacy wireguard-outbound удалён из sing-box начиная с 1.13.0 (остался только
+    // endpoint): ядро принимает для type=wireguard только пустой outbound-стаб и
+    // отклоняет любое поле сверх type/tag как "unknown field" (gso, interface_name,
+    // local_address, peer_public_key, system_interface, ...). Профили в этом формате
+    // сейчас в принципе не запускаются этим ядром (не только в параллельной проверке),
+    // поэтому сразу помечаем их неподдерживаемыми, не пытаясь точечно чистить поля.
+    if outbound.get("type").and_then(|v| v.as_str()) == Some("wireguard") {
+        return Err(
+            "wireguard-профиль в устаревшем формате outbound не поддерживается этой версией sing-box (удалено в 1.13.0, нужен формат endpoint)"
+                .to_string(),
+        );
+    }
+
     if let Some(obj) = outbound.as_object_mut() {
         obj.insert("tag".to_string(), Value::String(tag.to_string()));
     }
 
+    // Применяем per-outbound фикс транспорта (grpc с xhttp-полями -> xhttp) здесь же,
+    // а не только на уже объединённом конфиге в конце: иначе точечная проверка
+    // validate_outbound_standalone увидит ещё не пофикшенный outbound и ложно
+    // забракует рабочий профиль из-за "unknown field \"mode\"".
+    let mut wrapper = json!({ "outbounds": [outbound] });
+    fix_transport_type_and_mode(&mut wrapper);
+    let outbound = wrapper
+        .get_mut("outbounds")
+        .and_then(|o| o.as_array_mut())
+        .map(|arr| arr.remove(0))
+        .unwrap_or(wrapper);
+
     Ok(outbound)
+}
+
+/// Проверяет один outbound отдельным запуском `sing-box check` на минимальном
+/// конфиге-пробнике. Это защищает общий check-конфиг от любого битого профиля
+/// (невалидный адрес сервера, неподдерживаемый тип и т.п.): sing-box инициализирует
+/// все outbound'ы атомарно при старте, и один сломанный outbound не даёт подняться
+/// всему процессу — тогда не проверится вообще ни один профиль. Проверка не точечная
+/// (под конкретное известное поле), а общая: что бы ни было не так с профилем,
+/// он просто не попадёт в общий конфиг.
+fn validate_outbound_standalone(app: &AppHandle, idx: usize, outbound: &Value) -> Result<(), String> {
+    let Some(bin) = singbox_exe_path(app) else {
+        // Бинарник не нашли — не блокируем профиль из-за проблемы с самой проверкой,
+        // настоящая попытка запуска всё равно последует позже.
+        return Ok(());
+    };
+
+    let probe_cfg = json!({
+        "outbounds": [outbound, { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" }],
+        "route": { "final": "direct" },
+    });
+
+    let path = std::env::temp_dir().join(format!("singbox-profile-check-probe-{idx}.json"));
+    let json_str = serde_json::to_string(&probe_cfg).map_err(|e| e.to_string())?;
+    fs::write(&path, json_str).map_err(|e| e.to_string())?;
+
+    let mut cmd = Command::new(&bin);
+    cmd.arg("check").arg("-c").arg(&path);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = cmd.output();
+    let _ = fs::remove_file(&path);
+
+    match output {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Err(first_line(text.trim()).to_string())
+        }
+        Err(e) => {
+            warn!("Не удалось выполнить sing-box check для профиля: {}", e);
+            Ok(())
+        }
+    }
 }
 
 /// Собирает один конфиг sing-box, в котором каждый профиль представлен отдельным
@@ -165,6 +244,7 @@ fn extract_profile_outbound(cfg: &ProxyConfig, tag: &str) -> Result<Value, Strin
 /// Профили, у которых не удалось извлечь outbound, в конфиг не попадают — для них
 /// сразу формируется ProfileCheckResult с ошибкой (возвращается отдельно).
 pub(crate) fn build_parallel_check_config(
+    app: &AppHandle,
     configs: &[ProxyConfig],
 ) -> (Value, Vec<(String, u16)>, Vec<ProfileCheckResult>) {
     let mut outbounds: Vec<Value> = Vec::with_capacity(configs.len() + 2);
@@ -178,7 +258,13 @@ pub(crate) fn build_parallel_check_config(
         let in_tag = format!("chk-in-{idx}");
         let port = PROFILE_CHECK_BASE_PORT.saturating_add(idx as u16);
 
-        match extract_profile_outbound(cfg, &out_tag) {
+        let extracted = extract_profile_outbound(cfg, &out_tag)
+            .and_then(|outbound| match validate_outbound_standalone(app, idx, &outbound) {
+                Ok(()) => Ok(outbound),
+                Err(e) => Err(e),
+            });
+
+        match extracted {
             Ok(outbound) => {
                 outbounds.push(outbound);
                 inbounds.push(json!({
@@ -416,7 +502,7 @@ pub async fn check_profiles(app: AppHandle, state: SharedState<'_>) -> Result<Ve
         });
     }
 
-    let (merged_config, mapping, immediate_failures) = build_parallel_check_config(&configs);
+    let (merged_config, mapping, immediate_failures) = build_parallel_check_config(&app, &configs);
 
     let mut results: Vec<ProfileCheckResult> = immediate_failures;
 
