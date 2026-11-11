@@ -30,6 +30,9 @@ pub struct AppState {
     /// Размер sing-box.log на момент последнего запуска ядра: всё, что дописано
     /// после этой позиции, относится к текущему запуску (нужно для разбора причин сбоя).
     pub singbox_log_offset: AtomicU64,
+    /// Защита от параллельного запуска sing-box: true, пока singbox_start_platform
+    /// выполняется, чтобы повторный вызов (например двойной клик) не поднял второй процесс.
+    pub singbox_starting: AtomicBool,
 }
 
 pub(crate) type SharedState<'a> = State<'a, Arc<AppState>>;

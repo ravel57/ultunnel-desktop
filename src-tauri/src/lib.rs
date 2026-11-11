@@ -151,6 +151,7 @@ pub fn run() {
                 singbox: Mutex::new(None),
                 log_guard: Mutex::new(log_guard),
                 singbox_log_offset: AtomicU64::new(0),
+                singbox_starting: AtomicBool::new(false),
             });
 
             app.manage(state.clone());

@@ -358,8 +358,32 @@ pub(crate) fn wait_singbox_running_windows(timeout_ms: u64) -> bool {
     false
 }
 
+/// RAII-guard: снимает флаг "запуск выполняется" при выходе из функции
+/// через любой return (успех, ошибка, ранний выход).
+struct StartGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for StartGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 #[tauri::command]
 pub async fn singbox_start_platform(app: AppHandle, state: SharedState<'_>) -> Result<(), String> {
+    // Защита от параллельного запуска: если singbox_start_platform уже выполняется
+    // (например, из-за повторного клика до ответа первого вызова), второй вызов не
+    // должен поднимать ещё один процесс sing-box — иначе оба runas-запуска дерутся
+    // за один и тот же TUN-адаптер и оба падают.
+    if state
+        .singbox_starting
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        warn!("Запуск VPN пропущен: запуск уже выполняется (повторный вызов)");
+        return Err("Запуск VPN уже выполняется, подождите".into());
+    }
+    let _start_guard = StartGuard(&state.singbox_starting);
+
     // уже запущено — считаем успехом
     #[cfg(target_os = "windows")]
     {

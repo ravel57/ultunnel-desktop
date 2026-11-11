@@ -216,6 +216,7 @@
 		<button
 			class="fab"
 			:class="{ on: isRunning }"
+			:disabled="vpnBusy"
 			@click="toggleRun"
 			:title="isRunning ? 'Остановить' : 'Запустить'"
 		>
@@ -473,6 +474,9 @@ export default defineComponent({
 		activeTab: 'control' as 'control' | 'settings',
 
 		isRunning: false,
+		// true, пока выполняется singbox_start_platform/singbox_stop_platform —
+		// блокирует повторный клик, который иначе запускал бы второй процесс sing-box.
+		vpnBusy: false,
 
 		dashboard: {
 			upBps: 0,
@@ -654,6 +658,8 @@ export default defineComponent({
 		},
 
 		async toggleRun() {
+			if (this.vpnBusy) return
+			this.vpnBusy = true
 			try {
 				this.errorText = ''
 				if (this.isRunning) {
@@ -674,6 +680,8 @@ export default defineComponent({
 			} catch (e: any) {
 				this.errorText = String(e)
 				this.isRunning = await invoke<boolean>('get_state').catch(() => false)
+			} finally {
+				this.vpnBusy = false
 			}
 		},
 
@@ -776,10 +784,15 @@ export default defineComponent({
 		async saveSplit(): Promise<void> {
 			await invoke("set_split_routing", {split: this.split})
 			// применить сразу
-			if (this.isRunning) {
-				await invoke("singbox_stop_platform")
-				await invoke("singbox_start_platform")
-				this.isRunning = true
+			if (this.isRunning && !this.vpnBusy) {
+				this.vpnBusy = true
+				try {
+					await invoke("singbox_stop_platform")
+					await invoke("singbox_start_platform")
+					this.isRunning = true
+				} finally {
+					this.vpnBusy = false
+				}
 			}
 		},
 
@@ -880,10 +893,15 @@ export default defineComponent({
 			this.dnsServers = next
 
 			// применить сразу
-			if (this.isRunning) {
-				await invoke("singbox_stop_platform")
-				await invoke("singbox_start_platform")
-				this.isRunning = true
+			if (this.isRunning && !this.vpnBusy) {
+				this.vpnBusy = true
+				try {
+					await invoke("singbox_stop_platform")
+					await invoke("singbox_start_platform")
+					this.isRunning = true
+				} finally {
+					this.vpnBusy = false
+				}
 			}
 			return true
 		},
@@ -911,10 +929,15 @@ export default defineComponent({
 			await invoke("set_socks5_inbound", {enabled: this.socks5Inbound})
 
 			// применить сразу
-			if (this.isRunning) {
-				await invoke("singbox_stop_platform")
-				await invoke("singbox_start_platform")
-				this.isRunning = true
+			if (this.isRunning && !this.vpnBusy) {
+				this.vpnBusy = true
+				try {
+					await invoke("singbox_stop_platform")
+					await invoke("singbox_start_platform")
+					this.isRunning = true
+				} finally {
+					this.vpnBusy = false
+				}
 			}
 		},
 
