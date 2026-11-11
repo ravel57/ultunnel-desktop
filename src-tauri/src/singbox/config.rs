@@ -35,6 +35,20 @@ pub(crate) fn normalize_primary_outbound_tag(cfg: &mut Value) {
         None => return,
     };
 
+    // WireGuard/AmneziaWG profiles carry their real proxy as an "endpoints" entry already
+    // tagged "proxy" (WireGuard stopped being an outbound in sing-box 1.11.0, removed in
+    // 1.13.0); "outbounds" there holds only the boilerplate direct/block entries. Renaming
+    // outbounds[0] to "proxy" here would duplicate that tag and sing-box refuses to start
+    // the whole config ("duplicate outbound/endpoint tag: proxy").
+    let has_endpoints = root
+        .get("endpoints")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if has_endpoints {
+        return;
+    }
+
     let outbounds = match root.get_mut("outbounds").and_then(|v| v.as_array_mut()) {
         Some(v) => v,
         None => return,

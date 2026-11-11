@@ -114,13 +114,41 @@ pub fn normalize_configs(raw: Value) -> Result<Vec<ProxyConfig>, String> {
                     );
                     continue;
                 };
+                // Протокол берём из первого реального outbound/endpoint, а не buквально
+                // из outbounds[0]: WireGuard/AmneziaWG — это endpoint (не outbound) начиная
+                // с sing-box 1.11.0, и тогда outbounds содержит только "direct"/"block".
+                let is_boilerplate_type = |t: &str| matches!(t, "direct" | "block" | "dns");
+                let type_of = |v: &serde_json::Value| {
+                    let protocol = v.get("type").and_then(|x| x.as_str())?;
+                    let amnezia = protocol == "wireguard" && [
+                        "jc", "jmin", "jmax", "s1", "s2", "s3", "s4",
+                        "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4", "i5",
+                        "header_protection_key", "content_padding_addition", "rekey_after_time",
+                        "rekey_timeout", "reject_after_time", "keepalive_timeout",
+                        "max_handshake_attempts", "random_trailers", "disable_cookies",
+                    ].iter().any(|key| v.get(*key).is_some_and(|value| match value {
+                        Value::Null => false,
+                        Value::Bool(value) => *value,
+                        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+                        Value::String(value) => !value.is_empty(),
+                        _ => false,
+                    }));
+                    Some(if amnezia { "amnezia_wg" } else { protocol }.to_string())
+                };
                 let protocol = cfg_v
-                    .get("outbounds")
+                    .get("endpoints")
                     .and_then(|x| x.as_array())
-                    .and_then(|arr| arr.get(0))
-                    .and_then(|obj| obj.get("type"))
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("unknown");
+                    .and_then(|arr| arr.iter().find_map(type_of))
+                    .or_else(|| {
+                        cfg_v
+                            .get("outbounds")
+                            .and_then(|x| x.as_array())
+                            .and_then(|arr| {
+                                arr.iter()
+                                    .find_map(|o| type_of(o).filter(|t| !is_boilerplate_type(t)))
+                            })
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
                 let name = format!("{}-{}", server, protocol);
                 out.push(ProxyConfig {
                     name,

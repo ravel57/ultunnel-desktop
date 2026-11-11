@@ -1,24 +1,25 @@
 //! Проверка профилей: один инстанс sing-box со всеми профилями как outbound'ами,
 //! каждому — свой локальный mixed-inbound, проверка внешнего IP идёт по всем
-//! профилям параллельно за один проход (таймаут на профиль — 2.5 с).
+//! профилям параллельно за один проход (таймаут на запрос — 10 с).
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 use std::time::Instant;
 
 use futures_util::future::join_all;
 use serde::Serialize;
-use serde_json::Value;
 use serde_json::json;
+use serde_json::Value;
 use tauri::AppHandle;
 use tauri::Emitter;
 use tauri::Manager;
@@ -30,27 +31,26 @@ use crate::api::ProxyConfig;
 use crate::singbox::config::apply_singbox_logging;
 use crate::singbox::config::ensure_clash_api;
 use crate::singbox::config::fix_transport_type_and_mode;
-use crate::singbox::config::normalize_primary_outbound_tag;
 use crate::singbox::diagnostics::begin_singbox_run;
 use crate::singbox::diagnostics::describe_singbox_failure;
 use crate::singbox::diagnostics::first_line;
-#[cfg(target_os = "windows")]
-use crate::singbox::process::is_singbox_running_windows;
 use crate::singbox::diagnostics::prepare_singbox_log_file;
 use crate::singbox::diagnostics::singbox_extra_args;
-use crate::singbox::singbox_exe_path;
-#[cfg(windows)]
-use crate::singbox::CREATE_NO_WINDOW;
+#[cfg(target_os = "windows")]
+use crate::singbox::process::is_singbox_running_windows;
 #[cfg(target_os = "windows")]
 use crate::singbox::process::singbox_start_admin;
-use crate::singbox::process::singbox_start_root;
 use crate::singbox::process::singbox_start_platform;
+use crate::singbox::process::singbox_start_root;
 #[cfg(target_os = "windows")]
 use crate::singbox::process::singbox_stop_admin;
 use crate::singbox::process::singbox_stop_root;
 use crate::singbox::process::wait_for_clash_api;
 #[cfg(target_os = "windows")]
 use crate::singbox::process::wait_singbox_running_windows;
+use crate::singbox::singbox_exe_path;
+#[cfg(windows)]
+use crate::singbox::CREATE_NO_WINDOW;
 use crate::state::AppState;
 use crate::state::SharedState;
 
@@ -58,8 +58,8 @@ use crate::state::SharedState;
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 use crate::singbox::process::kill_singbox;
 
-/// Таймаут на проверку одного профиля (запрос внешнего IP через его локальный прокси).
-const PROFILE_CHECK_TIMEOUT: Duration = Duration::from_millis(2500);
+/// Таймаут одного запроса с учётом первого handshake WireGuard/AmneziaWG.
+const PROFILE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Порт первого локального mixed-inbound'а для проверки; остальным профилям
 /// порты выделяются последовательно (base + индекс).
@@ -120,7 +120,10 @@ pub(crate) fn is_platform_running(state: &Arc<AppState>) -> bool {
     }
 }
 
-pub(crate) async fn stop_platform_for_profile_check(app: AppHandle, state: &Arc<AppState>) -> Result<(), String> {
+pub(crate) async fn stop_platform_for_profile_check(
+    app: AppHandle,
+    state: &Arc<AppState>,
+) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let r = singbox_stop_root(app).await;
@@ -142,50 +145,191 @@ pub(crate) async fn stop_platform_for_profile_check(app: AppHandle, state: &Arc<
     }
 }
 
-/// Берёт из полного конфига профиля его основной outbound (после нормализации тега
-/// и фикса wireguard-порта) и переименовывает тег, чтобы несколько профилей можно
-/// было объединить в одном конфиге без коллизий.
-fn extract_profile_outbound(cfg: &ProxyConfig, tag: &str) -> Result<Value, String> {
-    let mut v = cfg.config.clone();
-    normalize_primary_outbound_tag(&mut v);
-
-    let mut outbound = v
-        .get("outbounds")
-        .and_then(|o| o.as_array())
-        .and_then(|arr| arr.first())
-        .cloned()
-        .ok_or_else(|| format!("у профиля {:?} нет outbounds[0]", cfg.name))?;
-
-    // Legacy wireguard-outbound удалён из sing-box начиная с 1.13.0 (остался только
-    // endpoint): ядро принимает для type=wireguard только пустой outbound-стаб и
-    // отклоняет любое поле сверх type/tag как "unknown field" (gso, interface_name,
-    // local_address, peer_public_key, system_interface, ...). Профили в этом формате
-    // сейчас в принципе не запускаются этим ядром (не только в параллельной проверке),
-    // поэтому сразу помечаем их неподдерживаемыми, не пытаясь точечно чистить поля.
-    if outbound.get("type").and_then(|v| v.as_str()) == Some("wireguard") {
-        return Err(
-            "wireguard-профиль в устаревшем формате outbound не поддерживается этой версией sing-box (удалено в 1.13.0, нужен формат endpoint)"
-                .to_string(),
-        );
+fn strip_ansi_escape_codes(text: &str) -> String {
+    let mut output = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        } else {
+            output.push(ch);
+        }
     }
+    output
+}
 
-    if let Some(obj) = outbound.as_object_mut() {
-        obj.insert("tag".to_string(), Value::String(tag.to_string()));
+struct ProfileCheckRoute {
+    outbounds: Vec<Value>,
+    endpoints: Vec<Value>,
+}
+
+// Keep the complete dependency graph, with a separate tag namespace per profile.
+fn extract_profile_outbound(cfg: &ProxyConfig, tag: &str) -> Result<ProfileCheckRoute, String> {
+    let mut config = cfg.config.clone();
+    fix_transport_type_and_mode(&mut config);
+    let mut nodes: HashMap<String, (Value, bool)> = HashMap::new();
+    let mut first_proxy = None;
+    for (section, endpoint) in [("endpoints", true), ("outbounds", false)] {
+        if let Some(entries) = config.get(section).and_then(Value::as_array) {
+            for (index, entry) in entries.iter().enumerate() {
+                let original = entry
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("__{section}_{index}"));
+                let kind = entry.get("type").and_then(Value::as_str).unwrap_or("");
+                if first_proxy.is_none() && !matches!(kind, "direct" | "block" | "dns" | "") {
+                    first_proxy = Some(original.clone());
+                }
+                if nodes.insert(original, (entry.clone(), endpoint)).is_some() {
+                    return Err("В профиле повторяется тег outbound/endpoint".into());
+                }
+            }
+        }
     }
+    let primary = nodes
+        .contains_key("proxy")
+        .then(|| "proxy".to_string())
+        .or_else(|| {
+            config
+                .pointer("/route/final")
+                .and_then(Value::as_str)
+                .filter(|name| {
+                    nodes.get(*name).is_some_and(|(node, _)| {
+                        !matches!(
+                            node.get("type").and_then(Value::as_str),
+                            Some("direct" | "block" | "dns")
+                        )
+                    })
+                })
+                .map(str::to_string)
+        })
+        .or(first_proxy)
+        .ok_or("В профиле нет основного outbound/endpoint")?;
+    let mut ordered = Vec::new();
+    let mut visited = HashSet::new();
+    let mut active = HashSet::new();
+    collect_profile_dependencies(&primary, &nodes, &mut visited, &mut active, &mut ordered)?;
+    let tags: HashMap<String, String> = ordered
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            (
+                name.clone(),
+                if *name == primary {
+                    tag.to_string()
+                } else {
+                    format!("{tag}-dep-{index}")
+                },
+            )
+        })
+        .collect();
+    let mut route = ProfileCheckRoute {
+        outbounds: Vec::new(),
+        endpoints: Vec::new(),
+    };
+    for name in ordered {
+        let (mut entry, endpoint) = nodes.remove(&name).ok_or("Потеряна зависимость профиля")?;
+        let obj = entry
+            .as_object_mut()
+            .ok_or("Некорректный outbound/endpoint")?;
+        obj.insert("tag".into(), json!(tags[&name]));
+        for key in ["detour", "default"] {
+            if let Some(reference) = obj.get(key).and_then(Value::as_str) {
+                if !reference.is_empty() {
+                    let renamed = tags
+                        .get(reference)
+                        .ok_or_else(|| format!("Не найдена зависимость {reference}"))?;
+                    obj.insert(key.into(), json!(renamed));
+                }
+            }
+        }
+        if let Some(entries) = obj.get_mut("outbounds").and_then(Value::as_array_mut) {
+            for reference in entries {
+                let original = reference.as_str().ok_or("Некорректный тег зависимости")?;
+                *reference = json!(tags.get(original).ok_or("Не найдена зависимость профиля")?);
+            }
+        }
+        if obj.get("type").and_then(Value::as_str) == Some("wireguard") {
+            if !endpoint {
+                return Err("Устаревший WireGuard outbound: нужен формат endpoint".into());
+            }
+            let peers = obj
+                .get("peers")
+                .and_then(Value::as_array)
+                .ok_or("У WireGuard/AmneziaWG отсутствуют peers")?;
+            if peers.is_empty()
+                || peers.iter().any(|peer| {
+                    peer.get("address")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .is_empty()
+                        || peer.get("port").and_then(Value::as_u64).unwrap_or(0) == 0
+                })
+            {
+                return Err("В конфиге WireGuard/AmneziaWG отсутствует адрес или порт peer. Обновите конфиги из админки".into());
+            }
+            obj.insert("system".into(), json!(false));
+            obj.remove("name");
+            obj.insert("listen_port".into(), json!(0));
+        }
+        if endpoint {
+            route.endpoints.push(entry);
+        } else {
+            route.outbounds.push(entry);
+        }
+    }
+    Ok(route)
+}
 
-    // Применяем per-outbound фикс транспорта (grpc с xhttp-полями -> xhttp) здесь же,
-    // а не только на уже объединённом конфиге в конце: иначе точечная проверка
-    // validate_outbound_standalone увидит ещё не пофикшенный outbound и ложно
-    // забракует рабочий профиль из-за "unknown field \"mode\"".
-    let mut wrapper = json!({ "outbounds": [outbound] });
-    fix_transport_type_and_mode(&mut wrapper);
-    let outbound = wrapper
-        .get_mut("outbounds")
-        .and_then(|o| o.as_array_mut())
-        .map(|arr| arr.remove(0))
-        .unwrap_or(wrapper);
-
-    Ok(outbound)
+fn collect_profile_dependencies(
+    name: &str,
+    nodes: &HashMap<String, (Value, bool)>,
+    visited: &mut HashSet<String>,
+    active: &mut HashSet<String>,
+    ordered: &mut Vec<String>,
+) -> Result<(), String> {
+    if active.contains(name) {
+        return Err(format!("Циклическая зависимость профиля: {name}"));
+    }
+    if visited.contains(name) {
+        return Ok(());
+    }
+    let (entry, _) = nodes
+        .get(name)
+        .ok_or_else(|| format!("Не найдена зависимость профиля: {name}"))?;
+    active.insert(name.to_string());
+    let mut dependencies = Vec::new();
+    for key in ["detour", "default"] {
+        if let Some(reference) = entry
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        {
+            dependencies.push(reference);
+        }
+    }
+    if let Some(references) = entry.get("outbounds").and_then(Value::as_array) {
+        for reference in references {
+            dependencies.push(
+                reference
+                    .as_str()
+                    .ok_or("Некорректная зависимость профиля")?,
+            );
+        }
+    }
+    for dependency in dependencies {
+        collect_profile_dependencies(dependency, nodes, visited, active, ordered)?;
+    }
+    active.remove(name);
+    visited.insert(name.to_string());
+    ordered.push(name.to_string());
+    Ok(())
 }
 
 /// Проверяет один outbound отдельным запуском `sing-box check` на минимальном
@@ -195,17 +339,27 @@ fn extract_profile_outbound(cfg: &ProxyConfig, tag: &str) -> Result<Value, Strin
 /// всему процессу — тогда не проверится вообще ни один профиль. Проверка не точечная
 /// (под конкретное известное поле), а общая: что бы ни было не так с профилем,
 /// он просто не попадёт в общий конфиг.
-fn validate_outbound_standalone(app: &AppHandle, idx: usize, outbound: &Value) -> Result<(), String> {
+fn validate_outbound_standalone(
+    app: &AppHandle,
+    idx: usize,
+    route: &ProfileCheckRoute,
+) -> Result<(), String> {
     let Some(bin) = singbox_exe_path(app) else {
         // Бинарник не нашли — не блокируем профиль из-за проблемы с самой проверкой,
         // настоящая попытка запуска всё равно последует позже.
         return Ok(());
     };
 
-    let probe_cfg = json!({
-        "outbounds": [outbound, { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" }],
-        "route": { "final": "direct" },
+    let mut probe_cfg = json!({
+        "dns": { "strategy": "ipv4_only", "servers": [{ "type": "udp", "tag": "bootstrap", "server": "1.1.1.1" }] },
+        "outbounds": [{ "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" }],
+        "route": { "final": "direct", "default_domain_resolver": { "server": "bootstrap", "strategy": "ipv4_only" } },
     });
+    probe_cfg["endpoints"] = json!(route.endpoints);
+    probe_cfg["outbounds"]
+        .as_array_mut()
+        .unwrap()
+        .extend(route.outbounds.iter().cloned());
 
     let path = std::env::temp_dir().join(format!("singbox-profile-check-probe-{idx}.json"));
     let json_str = serde_json::to_string(&probe_cfg).map_err(|e| e.to_string())?;
@@ -227,7 +381,12 @@ fn validate_outbound_standalone(app: &AppHandle, idx: usize, outbound: &Value) -
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
-            Err(first_line(text.trim()).to_string())
+            let clean = strip_ansi_escape_codes(&text);
+            if clean.contains("naive outbound is not included in this build") {
+                Err("В ядре sing-box нет поддержки Naive. Нужен бинарник с тегом with_naive_outbound".into())
+            } else {
+                Err(first_line(clean.trim()).to_string())
+            }
         }
         Err(e) => {
             warn!("Не удалось выполнить sing-box check для профиля: {}", e);
@@ -247,6 +406,7 @@ pub(crate) fn build_parallel_check_config(
     app: &AppHandle,
     configs: &[ProxyConfig],
 ) -> (Value, Vec<(String, u16)>, Vec<ProfileCheckResult>) {
+    let mut endpoints: Vec<Value> = Vec::new();
     let mut outbounds: Vec<Value> = Vec::with_capacity(configs.len() + 2);
     let mut inbounds: Vec<Value> = Vec::with_capacity(configs.len());
     let mut rules: Vec<Value> = Vec::with_capacity(configs.len());
@@ -258,15 +418,15 @@ pub(crate) fn build_parallel_check_config(
         let in_tag = format!("chk-in-{idx}");
         let port = PROFILE_CHECK_BASE_PORT.saturating_add(idx as u16);
 
-        let extracted = extract_profile_outbound(cfg, &out_tag)
-            .and_then(|outbound| match validate_outbound_standalone(app, idx, &outbound) {
-                Ok(()) => Ok(outbound),
-                Err(e) => Err(e),
-            });
+        let extracted = extract_profile_outbound(cfg, &out_tag).and_then(|route| {
+            validate_outbound_standalone(app, idx, &route)?;
+            Ok(route)
+        });
 
         match extracted {
-            Ok(outbound) => {
-                outbounds.push(outbound);
+            Ok(route) => {
+                endpoints.extend(route.endpoints);
+                outbounds.extend(route.outbounds);
                 inbounds.push(json!({
                     "type": "mixed",
                     "tag": in_tag,
@@ -292,11 +452,15 @@ pub(crate) fn build_parallel_check_config(
     outbounds.push(json!({ "type": "block", "tag": "block" }));
 
     let mut cfg_value = json!({
+        "dns": { "strategy": "ipv4_only", "servers": [{ "type": "udp", "tag": "bootstrap", "server": "1.1.1.1" }] },
+        "endpoints": endpoints,
         "inbounds": inbounds,
         "outbounds": outbounds,
         "route": {
             "rules": rules,
             "final": "block",
+            "auto_detect_interface": true,
+            "default_domain_resolver": { "server": "bootstrap", "strategy": "ipv4_only" },
         },
     });
 
@@ -336,7 +500,11 @@ pub(crate) async fn start_singbox_for_check(
         if let Err(e) = singbox_start_root(cfg_path_str, Some(singbox_extra_args(&app))).await {
             state.running.store(false, Ordering::Relaxed);
             error!("Проверка профилей: запуск sing-box не удался: {}", e);
-            return Err(describe_singbox_failure(&app, state, &format!("Не удалось запустить sing-box ({})", first_line(&e))));
+            return Err(describe_singbox_failure(
+                &app,
+                state,
+                &format!("Не удалось запустить sing-box ({})", first_line(&e)),
+            ));
         }
 
         if !wait_for_clash_api(5000).await {
@@ -357,7 +525,11 @@ pub(crate) async fn start_singbox_for_check(
         if let Err(e) = singbox_start_admin(app.clone(), cfg_path_str) {
             state.running.store(false, Ordering::Relaxed);
             error!("Проверка профилей: запуск sing-box не удался: {}", e);
-            return Err(describe_singbox_failure(&app, state, &format!("Не удалось запустить sing-box ({})", first_line(&e))));
+            return Err(describe_singbox_failure(
+                &app,
+                state,
+                &format!("Не удалось запустить sing-box ({})", first_line(&e)),
+            ));
         }
 
         if !wait_singbox_running_windows(2500) {
@@ -390,44 +562,57 @@ pub(crate) async fn start_singbox_for_check(
     }
 }
 
-/// Запрашивает внешний IP через локальный mixed-inbound конкретного профиля.
-/// Таймаут на весь запрос — 2.5 с (PROFILE_CHECK_TIMEOUT).
+/// Запрашивает IP через mixed-inbound профиля; резервный сервис использует тот же туннель.
 async fn fetch_ip_through_local_proxy(port: u16) -> Result<String, String> {
     let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{port}"))
         .map_err(|e| format!("не удалось настроить локальный прокси: {e}"))?;
 
     let client = reqwest::Client::builder()
         .proxy(proxy)
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(PROFILE_CHECK_TIMEOUT)
         .build()
         .map_err(|e| e.to_string())?;
 
-    let resp = client
-        .get("https://ipinfo.io/ip")
-        .header(reqwest::header::USER_AGENT, "ultunnel-desktop")
-        .send()
-        .await
-        .map_err(|e| format!("запрос ipinfo через профиль не удался: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("ipinfo вернул HTTP {}", resp.status()));
+    let mut errors = Vec::new();
+    for url in ["https://ipinfo.io/ip", "https://api.ipify.org"] {
+        let response = client
+            .get(url)
+            .header(reqwest::header::USER_AGENT, "ultunnel-desktop")
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => match response.text().await {
+                Ok(body) => match body.trim().parse::<std::net::IpAddr>() {
+                    Ok(ip) => return Ok(ip.to_string()),
+                    Err(_) => errors.push(format!("{url}: ответ не содержит IP-адрес")),
+                },
+                Err(error) => errors.push(format!("{url}: ошибка чтения: {error:?}")),
+            },
+            Ok(response) => errors.push(format!("{url}: HTTP {}", response.status())),
+            Err(error) => {
+                let reason = if error.is_timeout() {
+                    "таймаут 10 с"
+                } else {
+                    "ошибка запроса"
+                };
+                errors.push(format!("{url}: {reason}: {error:?}"));
+            }
+        }
     }
-
-    let ip = resp
-        .text()
-        .await
-        .map_err(|e| format!("не удалось прочитать ответ ipinfo: {e}"))?
-        .trim()
-        .to_string();
-
-    if ip.is_empty() {
-        Err("ipinfo вернул пустой IP".to_string())
-    } else {
-        Ok(ip)
-    }
+    Err(format!(
+        "Не удалось получить IP через профиль: {}",
+        errors.join("; ")
+    ))
 }
 
-async fn check_one_profile(app: AppHandle, name: String, port: u16, total: usize, done: Arc<AtomicUsize>) -> ProfileCheckResult {
+async fn check_one_profile(
+    app: AppHandle,
+    name: String,
+    port: u16,
+    total: usize,
+    done: Arc<AtomicUsize>,
+) -> ProfileCheckResult {
     let result = match fetch_ip_through_local_proxy(port).await {
         Ok(ip) => {
             info!("Проверка профиля {:?}: успешно, внешний IP {}", name, ip);
@@ -450,20 +635,26 @@ async fn check_one_profile(app: AppHandle, name: String, port: u16, total: usize
     };
 
     let completed = done.fetch_add(1, Ordering::SeqCst) + 1;
-    emit_profile_check_event(&app, ProfileCheckEvent {
-        name: result.name.clone(),
-        index: completed,
-        total,
-        status: if result.ok { "success" } else { "fail" }.to_string(),
-        ip: result.ip.clone(),
-        error: result.error.clone(),
-    });
+    emit_profile_check_event(
+        &app,
+        ProfileCheckEvent {
+            name: result.name.clone(),
+            index: completed,
+            total,
+            status: if result.ok { "success" } else { "fail" }.to_string(),
+            ip: result.ip.clone(),
+            error: result.error.clone(),
+        },
+    );
 
     result
 }
 
 #[tauri::command]
-pub async fn check_profiles(app: AppHandle, state: SharedState<'_>) -> Result<Vec<ProfileCheckResult>, String> {
+pub async fn check_profiles(
+    app: AppHandle,
+    state: SharedState<'_>,
+) -> Result<Vec<ProfileCheckResult>, String> {
     let _check_guard = try_begin_profile_check().map_err(|e| {
         warn!("Проверка профилей не начата: {}", e);
         e
@@ -487,19 +678,25 @@ pub async fn check_profiles(app: AppHandle, state: SharedState<'_>) -> Result<Ve
     // Текущий sing-box (обычный рабочий VPN) всегда останавливаем — вместо него
     // на время проверки поднимается отдельный инстанс со всеми профилями сразу.
     if let Err(e) = stop_platform_for_profile_check(app.clone(), &state_arc).await {
-        warn!("Проверка профилей: не удалось остановить текущий sing-box: {}", e);
+        warn!(
+            "Проверка профилей: не удалось остановить текущий sing-box: {}",
+            e
+        );
     }
     sleep(Duration::from_millis(300));
 
     for cfg in configs.iter() {
-        emit_profile_check_event(&app, ProfileCheckEvent {
-            name: cfg.name.clone(),
-            index: 0,
-            total,
-            status: "checking".to_string(),
-            ip: None,
-            error: None,
-        });
+        emit_profile_check_event(
+            &app,
+            ProfileCheckEvent {
+                name: cfg.name.clone(),
+                index: 0,
+                total,
+                status: "checking".to_string(),
+                ip: None,
+                error: None,
+            },
+        );
     }
 
     let (merged_config, mapping, immediate_failures) = build_parallel_check_config(&app, &configs);
@@ -508,24 +705,26 @@ pub async fn check_profiles(app: AppHandle, state: SharedState<'_>) -> Result<Ve
 
     if !mapping.is_empty() {
         match write_parallel_check_config(&app, &merged_config) {
-            Ok(cfg_path) => match start_singbox_for_check(app.clone(), &state_arc, cfg_path).await {
-                Ok(()) => {
-                    let done = Arc::new(AtomicUsize::new(0));
-                    let tasks = mapping.into_iter().map(|(name, port)| {
-                        check_one_profile(app.clone(), name, port, total, done.clone())
-                    });
-                    results.extend(join_all(tasks).await);
+            Ok(cfg_path) => {
+                match start_singbox_for_check(app.clone(), &state_arc, cfg_path).await {
+                    Ok(()) => {
+                        let done = Arc::new(AtomicUsize::new(0));
+                        let tasks = mapping.into_iter().map(|(name, port)| {
+                            check_one_profile(app.clone(), name, port, total, done.clone())
+                        });
+                        results.extend(join_all(tasks).await);
+                    }
+                    Err(e) => {
+                        error!("Проверка профилей: не удалось запустить sing-box: {}", e);
+                        results.extend(mapping.into_iter().map(|(name, _)| ProfileCheckResult {
+                            name,
+                            ok: false,
+                            ip: None,
+                            error: Some(e.clone()),
+                        }));
+                    }
                 }
-                Err(e) => {
-                    error!("Проверка профилей: не удалось запустить sing-box: {}", e);
-                    results.extend(mapping.into_iter().map(|(name, _)| ProfileCheckResult {
-                        name,
-                        ok: false,
-                        ip: None,
-                        error: Some(e.clone()),
-                    }));
-                }
-            },
+            }
             Err(e) => {
                 error!("Проверка профилей: не удалось подготовить конфиг: {}", e);
                 results.extend(mapping.into_iter().map(|(name, _)| ProfileCheckResult {
@@ -557,14 +756,17 @@ pub async fn check_profiles(app: AppHandle, state: SharedState<'_>) -> Result<Ve
         total
     );
 
-    emit_profile_check_event(&app, ProfileCheckEvent {
-        name: String::new(),
-        index: total,
-        total,
-        status: "finished".to_string(),
-        ip: None,
-        error: None,
-    });
+    emit_profile_check_event(
+        &app,
+        ProfileCheckEvent {
+            name: String::new(),
+            index: total,
+            total,
+            status: "finished".to_string(),
+            ip: None,
+            error: None,
+        },
+    );
 
     Ok(results)
 }

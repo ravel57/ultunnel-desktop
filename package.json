@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "build:core": "bash scripts/build-sing-box.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.1",
