@@ -522,15 +522,18 @@ pub(crate) async fn start_singbox_for_check(
 
     #[cfg(target_os = "windows")]
     {
-        if let Err(e) = singbox_start_admin(app.clone(), cfg_path_str) {
-            state.running.store(false, Ordering::Relaxed);
-            error!("Проверка профилей: запуск sing-box не удался: {}", e);
-            return Err(describe_singbox_failure(
-                &app,
-                state,
-                &format!("Не удалось запустить sing-box ({})", first_line(&e)),
-            ));
-        }
+        // singbox_start_admin блокируется (WaitForSingleObject INFINITE) до завершения
+        // самого sing-box.exe, то есть на всё время проверки профилей — поэтому не ждём
+        // его здесь напрямую, иначе start_singbox_for_check никогда не вернёт управление
+        // для запуска самих проверок. Запускаем в отдельном потоке и проверяем результат
+        // через tasklist/Clash API, как и при обычном подключении.
+        let app_for_runas = app.clone();
+        let cfg_path_for_runas = cfg_path_str.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = singbox_start_admin(app_for_runas, cfg_path_for_runas) {
+                error!("Проверка профилей: запуск sing-box через runas завершился с ошибкой: {}", e);
+            }
+        });
 
         if !wait_singbox_running_windows(2500) {
             state.running.store(false, Ordering::Relaxed);

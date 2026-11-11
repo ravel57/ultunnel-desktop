@@ -454,12 +454,20 @@ pub async fn singbox_start_platform(app: AppHandle, state: SharedState<'_>) -> R
 
     #[cfg(target_os = "windows")]
     {
-        let r = singbox_start_admin(app.clone(), cfg_path_str);
-        if let Err(e) = r {
-            state.running.store(false, Ordering::Relaxed);
-            error!("Запуск sing-box не удался: {}", e);
-            return Err(describe_singbox_failure(&app, &state_arc, &format!("Не удалось запустить sing-box ({})", first_line(&e))));
-        }
+        // runas::Command::status() вызывает ShellExecuteExW и затем
+        // WaitForSingleObject(hProcess, INFINITE) — то есть блокируется до тех пор,
+        // пока сам sing-box.exe не завершится, а это происходит только при отключении
+        // VPN. Если ждать этот вызов прямо здесь, singbox_start_platform не вернёт
+        // ответ фронтенду, пока пользователь не нажмёт "Отключиться" — поэтому
+        // запускаем его в отдельном потоке и сами проверяем результат через
+        // tasklist/Clash API ниже.
+        let app_for_runas = app.clone();
+        let cfg_path_for_runas = cfg_path_str.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = singbox_start_admin(app_for_runas, cfg_path_for_runas) {
+                error!("Запуск sing-box через runas завершился с ошибкой: {}", e);
+            }
+        });
 
         if !wait_singbox_running_windows(2500) {
             state.running.store(false, Ordering::Relaxed);
