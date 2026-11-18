@@ -143,7 +143,9 @@ pub(crate) async fn singbox_stop_root(app: AppHandle) -> Result<(), String> {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        Ok(())
+        // pkill выше работает от пользователя и не может завершить sing-box, запущенный от root
+        // прежним helper'ом; добиваем такой процесс через helper.
+        stop_stale_singbox_macos().await
     }
 }
 
@@ -427,10 +429,22 @@ pub async fn singbox_start_platform(app: AppHandle, state: SharedState<'_>) -> R
         e
     })?;
     let cfg_path_str = cfg_path.to_string_lossy().to_string();
-    begin_singbox_run(&app, &state_arc, &cfg_path);
+    if let Err(e) = begin_singbox_run(&app, &state_arc, &cfg_path) {
+        state.running.store(false, Ordering::Relaxed);
+        error!("Запуск VPN отменён: конфиг профиля {:?} не прошёл sing-box check: {}", selected, e);
+        return Err(e);
+    }
 
     #[cfg(target_os = "macos")]
     {
+        // Иначе на 9090 ответит старый процесс, и запуск «удастся» со старым ядром.
+        if let Err(e) = install_helper_if_needed() {
+            warn!("Проверка оставшегося sing-box пропущена: helper недоступен: {}", e);
+        } else if let Err(e) = stop_stale_singbox_macos().await {
+            state.running.store(false, Ordering::Relaxed);
+            return Err(e);
+        }
+
         let r = singbox_start_root(cfg_path_str, Some(singbox_extra_args(&app))).await;
         if let Err(e) = r {
             state.running.store(false, Ordering::Relaxed);
@@ -535,6 +549,64 @@ pub async fn singbox_stop_platform(
 #[derive(Debug, Deserialize)]
 pub(crate) struct VersionResponse {
     pub(crate) version: Option<String>,
+}
+
+/// Отвечает ли сейчас кто-нибудь на Clash API (127.0.0.1:9090). Возвращает версию ядра, если да.
+#[cfg(target_os = "macos")]
+async fn clash_api_running_version() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(400))
+        .build()
+        .ok()?;
+    let r = client
+        .get(CLASH_API_VERSION_URL)
+        .bearer_auth(CLASH_API_SECRET)
+        .send()
+        .await
+        .ok()?;
+    if !r.status().is_success() {
+        return None;
+    }
+    Some(
+        r.json::<VersionResponse>()
+            .await
+            .ok()
+            .and_then(|v| v.version)
+            .unwrap_or_else(|| "неизвестна".into()),
+    )
+}
+
+/// Останавливает sing-box, оставшийся от прошлого запуска (например, после переустановки
+/// приложения: новый helper не знает процесс, запущенный старым). Пока такой процесс жив,
+/// новое ядро не может занять TUN и порт 9090 и сразу падает, а wait_for_clash_api
+/// получает ответ от старого процесса — приложение считает VPN запущенным со старым ядром.
+///
+/// Helper (до исправления в macos/helper) при устаревшем pid-файле убивает только pid из
+/// файла и не доходит до `pkill -x sing-box`; повторный вызов, уже без pid-файла, доходит —
+/// поэтому stop вызывается несколько раз.
+#[cfg(target_os = "macos")]
+pub(crate) async fn stop_stale_singbox_macos() -> Result<(), String> {
+    let Some(version) = clash_api_running_version().await else {
+        return Ok(());
+    };
+    warn!(
+        "Clash API уже отвечает (версия ядра: {}) — работает оставшийся процесс sing-box, останавливаем его",
+        version
+    );
+    for attempt in 1..=3 {
+        if let Err(e) = macos_smjobbless::helper_stop_singbox(HELPER_LABEL) {
+            warn!("Остановка оставшегося sing-box (попытка {}): {}", attempt, e);
+        }
+        for _ in 0..15 {
+            if clash_api_running_version().await.is_none() {
+                info!("Оставшийся процесс sing-box остановлен (попытка {})", attempt);
+                return Ok(());
+            }
+            sleep(Duration::from_millis(100));
+        }
+    }
+    error!("Не удалось остановить оставшийся процесс sing-box: Clash API всё ещё отвечает");
+    Err("Не удалось остановить ранее запущенный sing-box (порт 9090 занят). Перезапустите компьютер или завершите процесс sing-box вручную".into())
 }
 
 pub(crate) async fn wait_for_clash_api(timeout_ms: u64) -> bool {

@@ -11,6 +11,9 @@ mod macos_smjobbless;
 mod settings;
 mod singbox;
 mod state;
+mod tray;
+mod updater;
+mod vpn;
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -20,12 +23,8 @@ use std::sync::atomic::Ordering;
 
 use tauri::Manager;
 use tauri::WindowEvent;
-use tauri::menu::Menu;
-use tauri::menu::MenuItem;
-use tauri::tray::TrayIconBuilder;
 use tauri_plugin_single_instance::init as single_instance_init;
 use tracing::info;
-use tracing::warn;
 
 use crate::configs::configs_path_from_settings;
 use crate::configs::load_configs_from_file;
@@ -50,6 +49,8 @@ pub fn run() {
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(single_instance_init(|app, _argv, _cwd| {
             info!("Повторный запуск приложения — показываем существующее окно");
             if let Some(win) = app.get_webview_window("main") {
@@ -91,38 +92,7 @@ pub fn run() {
             let _ = APP_HANDLE.set(handle.clone());
             log_startup_info(&handle);
 
-            let show = MenuItem::with_id(app, "show", "Показать/Скрыть", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &quit])?;
-
-            TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("ultunnel-desktop")
-                .menu(&menu)
-                .show_menu_on_left_click(true)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => {
-                        if let Some(win) = app.get_webview_window("main") {
-                            let visible = win.is_visible().unwrap_or(true);
-                            info!("Трей: переключение окна ({})", if visible { "скрыть" } else { "показать" });
-                            if visible {
-                                let _ = win.hide();
-                            } else {
-                                let _ = win.show();
-                                let _ = win.set_focus();
-                            }
-                        } else {
-                            warn!("Трей: главное окно не найдено");
-                        }
-                    }
-                    "quit" => {
-                        info!("Трей: запрошен выход из приложения");
-                        EXITING.store(true, Ordering::SeqCst);
-                        app.exit(0);
-                    }
-                    other => warn!("Трей: неизвестный пункт меню {:?}", other),
-                })
-                .build(app)?;
+            tray::create_tray(app)?;
             let settings_path = handle
                 .path()
                 .app_data_dir()
@@ -157,6 +127,9 @@ pub fn run() {
             app.manage(state.clone());
             browser_api::spawn_browser_api(state.clone());
             spawn_singbox_watchdog(state.clone());
+            vpn::spawn_background_tasks(handle.clone(), state.clone());
+            updater::spawn_update_loop(handle.clone(), state.clone());
+            tray::refresh_tray();
             info!("Инициализация приложения завершена");
             Ok(())
         })
@@ -198,6 +171,21 @@ pub fn run() {
             autostart::set_autostart_enabled,
             singbox::stats::get_dashboard_stats,
             singbox::profile_check::check_profiles,
+            singbox::profile_check::cancel_profile_measurement,
+            singbox::connections::get_connections,
+            singbox::connections::close_connection,
+            singbox::routing_io::export_routing_settings,
+            singbox::routing_io::import_routing_settings,
+            vpn::vpn_connect,
+            vpn::vpn_disconnect,
+            vpn::vpn_restart,
+            vpn::get_vpn_status,
+            vpn::get_app_options,
+            vpn::set_app_options,
+            vpn::set_profile_ranking,
+            updater::get_update_state,
+            updater::check_for_updates,
+            updater::install_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -4,10 +4,18 @@ use serde_json::Value;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProxyConfig {
     pub name: String,
+    #[serde(default, rename = "subscriptionUrl")]
+    pub subscription_url: Option<String>,
+    #[serde(default, rename = "speedtestBaseUrl")]
+    pub speedtest_base_url: Option<String>,
     pub config: Value, // sing-box JSON
 }
 
 const CONFIGS_ENDPOINT: &str = "https://admin.ultunnel.ru/api/v1/get-users-proxy-servers-singbox";
+
+/// Хост панели (должен совпадать с хостом в CONFIGS_ENDPOINT). Трафик к нему идёт мимо VPN,
+/// чтобы обновление конфигов работало, даже если выбранный профиль не подключается.
+pub(crate) const API_HOST: &str = "admin.ultunnel.ru";
 
 pub async fn fetch_raw_configs(secret_key: &str) -> Result<Value, String> {
     let url = reqwest::Url::parse_with_params(
@@ -89,6 +97,8 @@ pub fn normalize_configs(raw: Value) -> Result<Vec<ProxyConfig>, String> {
     } else if looks_like_singbox_config(&raw) {
         return Ok(vec![ProxyConfig {
             name: "Default".into(),
+            subscription_url: raw.get("subscriptionUrl").and_then(Value::as_str).map(str::to_string),
+            speedtest_base_url: raw.get("speedtestBaseUrl").and_then(Value::as_str).map(str::to_string),
             config: raw,
         }]);
     } else {
@@ -152,6 +162,8 @@ pub fn normalize_configs(raw: Value) -> Result<Vec<ProxyConfig>, String> {
                 let name = format!("{}-{}", server, protocol);
                 out.push(ProxyConfig {
                     name,
+                    subscription_url: item.get("subscriptionUrl").and_then(Value::as_str).map(str::to_string),
+                    speedtest_base_url: item.get("speedtestBaseUrl").and_then(Value::as_str).map(str::to_string),
                     config: cfg_v.clone(),
                 });
             }

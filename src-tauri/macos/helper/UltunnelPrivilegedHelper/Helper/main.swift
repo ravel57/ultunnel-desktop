@@ -46,6 +46,7 @@ final class SingBoxRunner {
                 p.waitUntilExit()
                 process = nil
             }
+            var result = "stopped (fallback)"
             if let s = try? String(contentsOfFile: "/var/run/ultunnel-singbox.pid", encoding: .utf8),
             let pid = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)),
             pid > 1 {
@@ -59,12 +60,16 @@ final class SingBoxRunner {
                     _ = Darwin.kill(pid, SIGKILL)
                 }
                 try? FileManager.default.removeItem(atPath: "/var/run/ultunnel-singbox.pid")
-                return "stopped pid=\(pid)"
+                result = "stopped pid=\(pid)"
             }
-            runCmd("/usr/bin/pkill", ["-TERM", "-x", "sing-box"])
+            // Не выходим после pid-файла: он может указывать на уже умерший процесс, а sing-box,
+            // запущенный прежним экземпляром helper'а (до переустановки), остаётся работать,
+            // держит TUN и порт 9090. -U 0 — только root-процессы, пользовательские
+            // `sing-box check` не трогаем.
+            runCmd("/usr/bin/pkill", ["-TERM", "-U", "0", "-x", "sing-box"])
             usleep(100_000)
-            runCmd("/usr/bin/pkill", ["-KILL", "-x", "sing-box"])
-            return "stopped (fallback)"
+            runCmd("/usr/bin/pkill", ["-KILL", "-U", "0", "-x", "sing-box"])
+            return result
         }
     }
 

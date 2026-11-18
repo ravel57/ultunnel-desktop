@@ -71,13 +71,17 @@ pub(crate) fn prepare_singbox_log_file(app: &AppHandle) -> Option<PathBuf> {
 }
 
 /// Вызывается перед каждым запуском ядра: запоминает позицию в sing-box.log
-/// и проверяет конфиг.
-pub(crate) fn begin_singbox_run(app: &AppHandle, state: &Arc<AppState>, cfg_path: &Path) {
+/// и проверяет конфиг. Ошибка означает, что ядро конфиг не примет и запускать его не нужно.
+pub(crate) fn begin_singbox_run(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    cfg_path: &Path,
+) -> Result<(), String> {
     if let Some(log_path) = singbox_log_path(app).ok() {
         let len = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
         state.singbox_log_offset.store(len, Ordering::SeqCst);
     }
-    preflight_check_config(app, cfg_path);
+    preflight_check_config(app, cfg_path)
 }
 
 pub(crate) fn read_singbox_log_since(app: &AppHandle, state: &Arc<AppState>) -> String {
@@ -191,18 +195,29 @@ pub(crate) fn spawn_singbox_watchdog(state: Arc<AppState>) {
                     return;
                 }
             };
+            let health_client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(8))
+                .build()
+                .ok();
             let mut misses = 0u32;
+            let mut tick = 0u64;
+            let mut proxy_failures = 0u32;
             loop {
                 sleep(Duration::from_secs(3));
                 if EXITING.load(Ordering::SeqCst) {
                     return;
                 }
                 // во время проверки профилей ядро намеренно перезапускается
-                if PROFILE_CHECKING.load(Ordering::SeqCst) || !state.running.load(Ordering::Relaxed)
+                if PROFILE_CHECKING.load(Ordering::SeqCst)
+                    || !state.running.load(Ordering::Relaxed)
+                    || state.singbox_starting.load(Ordering::SeqCst)
+                    || crate::vpn::RECONNECTING.load(Ordering::SeqCst)
                 {
                     misses = 0;
+                    proxy_failures = 0;
                     continue;
                 }
+                tick += 1;
 
                 let alive = client
                     .get(CLASH_API_VERSION_URL)
@@ -215,6 +230,28 @@ pub(crate) fn spawn_singbox_watchdog(state: Arc<AppState>) {
                         info!("Clash API снова отвечает, ядро sing-box работает штатно");
                     }
                     misses = 0;
+                    // раз в ~15 с проверяем, что сервер реально пропускает трафик
+                    if tick % 5 == 0 {
+                        if let Some(hc) = &health_client {
+                            match crate::vpn::check_health(hc) {
+                                crate::vpn::Health::ProxyDown => {
+                                    proxy_failures += 1;
+                                    warn!("Проверка соединения: сервер не отвечает ({} подряд)", proxy_failures);
+                                    if proxy_failures >= 3 {
+                                        proxy_failures = 0;
+                                        crate::vpn::on_proxy_down();
+                                    }
+                                }
+                                crate::vpn::Health::Offline => {
+                                    if proxy_failures > 0 {
+                                        info!("Проверка соединения: нет сети, переподключение не требуется");
+                                    }
+                                    proxy_failures = 0;
+                                }
+                                crate::vpn::Health::Ok | crate::vpn::Health::Unknown => proxy_failures = 0,
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -236,6 +273,7 @@ pub(crate) fn spawn_singbox_watchdog(state: Arc<AppState>) {
                     );
                     error!("{}", msg);
                     state.running.store(false, Ordering::Relaxed);
+                    crate::vpn::on_core_crashed(msg);
                 } else {
                     let msg = describe_singbox_failure(
                         app,

@@ -51,10 +51,33 @@ pub fn set_selected_profile(state: State<'_, Arc<AppState>>, profile: String) ->
         Some(profile)
     };
     info!("Выбран профиль: {:?}", s.selected_config);
-    s.save(&state.settings_path).map_err(|e| {
+    let r = s.save(&state.settings_path).map_err(|e| {
         error!("Не удалось сохранить выбранный профиль: {}", e);
         e
-    })
+    });
+    drop(s);
+    crate::tray::refresh_tray();
+    r
+}
+
+/// Выбирает профиль из бэкенда (трей, автовыбор сервера) и сообщает об этом UI.
+pub(crate) fn select_profile_internal(state: &Arc<AppState>, name: &str) {
+    {
+        let mut s = state.settings.lock().unwrap();
+        if s.selected_config.as_deref() == Some(name) {
+            return;
+        }
+        s.selected_config = Some(name.to_string());
+        info!("Выбран профиль (из приложения): {:?}", name);
+        if let Err(e) = s.save(&state.settings_path) {
+            error!("Не удалось сохранить выбранный профиль: {}", e);
+        }
+    }
+    if let Some(app) = crate::state::APP_HANDLE.get() {
+        use tauri::Emitter;
+        let _ = app.emit("profile-selected", name.to_string());
+    }
+    crate::tray::refresh_tray();
 }
 
 #[tauri::command]
@@ -70,6 +93,12 @@ pub fn get_profiles(state: State<'_, Arc<AppState>>) -> Vec<String> {
 
 #[tauri::command]
 pub async fn load_configs(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {
+    refresh_configs(state.inner()).await
+}
+
+/// Загружает профили по ключу доступа, сохраняет их в configs.json и обновляет трей.
+/// При ошибке остаётся прежний (сохранённый) список.
+pub(crate) async fn refresh_configs(state: &Arc<AppState>) -> Result<Vec<String>, String> {
     let access_key = {
         let s = state.settings.lock().unwrap();
         s.access_key.clone()
@@ -113,8 +142,17 @@ pub async fn load_configs(state: State<'_, Arc<AppState>>) -> Result<Vec<String>
         e
     })?;
 
-    let names = configs.into_iter().map(|c| c.name).collect();
+    {
+        let mut s = state.settings.lock().unwrap();
+        s.subscription_updated_at = crate::vpn::unix_now();
+        if let Err(e) = s.save(&state.settings_path) {
+            warn!("Не удалось сохранить время обновления подписки: {}", e);
+        }
+    }
+
+    let names: Vec<String> = configs.into_iter().map(|c| c.name).collect();
     info!("Список конфигов обновлён");
+    crate::tray::refresh_tray();
     Ok(names)
 }
 

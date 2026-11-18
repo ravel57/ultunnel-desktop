@@ -1,7 +1,7 @@
 [package]
 build = "build.rs"
 name = "ultunnel-desktop"
-version = "0.2.0"
+version = "0.6.0"
 description = "ULtunnel desktop"
 authors = ["ravel57"]
 edition = "2021"
@@ -31,8 +31,11 @@ tauri-plugin-single-instance = "2"
 futures-util = "0.3"
 tauri-plugin-autostart = "2"
 axum = "0.8.9"
-tokio = { version = "1", features = ["net", "rt", "macros"] }
+tokio = { version = "1", features = ["net", "rt", "macros", "time"] }
 tower-http = { version = "0.7.1", features = ["cors"] }
+tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2"
+sha2 = "0.10"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(mobile)", "cfg(desktop)"] }

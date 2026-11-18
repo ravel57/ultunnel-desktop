@@ -9,5 +9,8 @@ triple="$(rustc -vV | sed -n 's/^host: //p')"
 tags="$(tr -d '\r\n' < "$core_dir/release/DEFAULT_BUILD_TAGS_OTHERS"),with_naive_outbound"
 mkdir -p "$desktop_dir/src-tauri/bin"
 cd "$core_dir"
-go build -tags "$tags" -o "$desktop_dir/src-tauri/bin/sing-box-$triple" ./cmd/sing-box
-printf 'Core with Naive support: %s\nRebuild the desktop app to bundle it.\n' "$desktop_dir/src-tauri/bin/sing-box-$triple"
+# Версия из git-тега форка (как в его Makefile), иначе `sing-box version` показывает "unknown".
+version="$(CGO_ENABLED=0 GOOS= GOARCH= go run ./cmd/internal/read_tag)"
+go build -tags "$tags" -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$version'" \
+	-o "$desktop_dir/src-tauri/bin/sing-box-$triple" ./cmd/sing-box
+printf 'Core %s with Naive support: %s\nRebuild the desktop app to bundle it.\n' "$version" "$desktop_dir/src-tauri/bin/sing-box-$triple"

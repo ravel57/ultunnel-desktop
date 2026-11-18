@@ -1,11 +1,13 @@
 //! Всё, что связано с ядром sing-box: конфиг, DNS, маршрутизация, процесс, диагностика.
 
 pub mod config;
+pub mod connections;
 pub mod diagnostics;
 pub mod dns;
 pub mod process;
 pub mod profile_check;
 pub mod routing;
+pub mod routing_io;
 pub mod stats;
 
 use std::path::PathBuf;
@@ -40,3 +42,5 @@ pub(crate) fn singbox_exe_path(app: &AppHandle) -> Option<PathBuf> {
         None
     }
 }
+
+pub mod speed_test;

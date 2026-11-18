@@ -16,6 +16,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use std::time::Instant;
 
+use super::speed_test::{self, Measurement, CANCELLED};
 use futures_util::future::join_all;
 use serde::Serialize;
 use serde_json::json;
@@ -71,6 +72,8 @@ pub(crate) static PROFILE_CHECKING: AtomicBool = AtomicBool::new(false);
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProfileCheckResult {
     name: String,
+    #[serde(flatten)]
+    measurement: Measurement,
     ok: bool,
     ip: Option<String>,
     error: Option<String>,
@@ -145,7 +148,7 @@ pub(crate) async fn stop_platform_for_profile_check(
     }
 }
 
-fn strip_ansi_escape_codes(text: &str) -> String {
+pub(crate) fn strip_ansi_escape_codes(text: &str) -> String {
     let mut output = String::new();
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -439,6 +442,7 @@ pub(crate) fn build_parallel_check_config(
             Err(e) => {
                 warn!("Проверка профилей: профиль {:?} пропущен: {}", cfg.name, e);
                 immediate_failures.push(ProfileCheckResult {
+                    measurement: Measurement::default(),
                     name: cfg.name.clone(),
                     ok: false,
                     ip: None,
@@ -493,7 +497,11 @@ pub(crate) async fn start_singbox_for_check(
     cfg_path: PathBuf,
 ) -> Result<(), String> {
     let cfg_path_str = cfg_path.to_string_lossy().to_string();
-    begin_singbox_run(&app, state, &cfg_path);
+    if let Err(e) = begin_singbox_run(&app, state, &cfg_path) {
+        state.running.store(false, Ordering::Relaxed);
+        error!("Проверка профилей: общий конфиг не прошёл sing-box check: {}", e);
+        return Err(e);
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -531,7 +539,10 @@ pub(crate) async fn start_singbox_for_check(
         let cfg_path_for_runas = cfg_path_str.clone();
         std::thread::spawn(move || {
             if let Err(e) = singbox_start_admin(app_for_runas, cfg_path_for_runas) {
-                error!("Проверка профилей: запуск sing-box через runas завершился с ошибкой: {}", e);
+                error!(
+                    "Проверка профилей: запуск sing-box через runas завершился с ошибкой: {}",
+                    e
+                );
             }
         });
 
@@ -616,10 +627,11 @@ async fn check_one_profile(
     total: usize,
     done: Arc<AtomicUsize>,
 ) -> ProfileCheckResult {
-    let result = match fetch_ip_through_local_proxy(port).await {
+    let mut result = match fetch_ip_through_local_proxy(port).await {
         Ok(ip) => {
             info!("Проверка профиля {:?}: успешно, внешний IP {}", name, ip);
             ProfileCheckResult {
+                measurement: Measurement::default(),
                 name: name.clone(),
                 ok: true,
                 ip: Some(ip),
@@ -629,6 +641,7 @@ async fn check_one_profile(
         Err(e) => {
             error!("Проверка профиля {:?}: неудача: {}", name, e);
             ProfileCheckResult {
+                measurement: Measurement::default(),
                 name: name.clone(),
                 ok: false,
                 ip: None,
@@ -637,6 +650,37 @@ async fn check_one_profile(
         }
     };
 
+    result.measurement.measured_at = Some(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    );
+    if result.ok {
+        match measure_ping(port).await {
+            Ok((ping, jitter, connect)) => {
+                result.measurement.ping_ms = Some(ping);
+                result.measurement.jitter_ms = Some(jitter);
+                result.measurement.connect_ms = Some(connect);
+            }
+            Err(e) => {
+                result.ok = false;
+                result.error = Some(e);
+            }
+        }
+        // Geography is optional and must not turn a working tunnel into a failure.
+        if let Ok(client) = proxy_client(port) {
+            if let Ok(response) = client.get("https://ipinfo.io/json").send().await {
+                if let Ok(geo) = response.json::<Value>().await {
+                    if geo["ip"].as_str() == result.ip.as_deref() {
+                        result.measurement.country = geo["country"].as_str().map(str::to_string);
+                        result.measurement.city = geo["city"].as_str().map(str::to_string);
+                    }
+                }
+            }
+        }
+    }
+    let _ = app.emit("server-measurement", &result);
     let completed = done.fetch_add(1, Ordering::SeqCst) + 1;
     emit_profile_check_event(
         &app,
@@ -657,11 +701,13 @@ async fn check_one_profile(
 pub async fn check_profiles(
     app: AppHandle,
     state: SharedState<'_>,
+    full: Option<bool>,
 ) -> Result<Vec<ProfileCheckResult>, String> {
     let _check_guard = try_begin_profile_check().map_err(|e| {
         warn!("Проверка профилей не начата: {}", e);
         e
     })?;
+    CANCELLED.store(false, Ordering::Relaxed);
     let state_arc = state.inner().clone();
     let configs = { state_arc.configs.lock().unwrap().clone() };
 
@@ -712,14 +758,86 @@ pub async fn check_profiles(
                 match start_singbox_for_check(app.clone(), &state_arc, cfg_path).await {
                     Ok(()) => {
                         let done = Arc::new(AtomicUsize::new(0));
-                        let tasks = mapping.into_iter().map(|(name, port)| {
-                            check_one_profile(app.clone(), name, port, total, done.clone())
+                        let tasks = mapping.iter().map(|(name, port)| {
+                            check_one_profile(app.clone(), name.clone(), *port, total, done.clone())
                         });
                         results.extend(join_all(tasks).await);
+                        if full.unwrap_or(false) {
+                            let panel_snis =
+                                speed_test::sibling_snis(configs.iter().map(|c| {
+                                    (c.name.as_str(), speed_test::profile_sni(&c.config))
+                                }));
+                            let mut queue: Vec<usize> =
+                                (0..results.len()).filter(|&i| results[i].ok).collect();
+                            queue.sort_by_key(|&i| results[i].measurement.ping_ms);
+                            for i in queue {
+                                if CANCELLED.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                let name = results[i].name.clone();
+                                let port = mapping.iter().find(|(n, _)| n == &name).unwrap().1;
+                                let profile = configs.iter().find(|c| c.name == name);
+                                let sni = profile
+                                    .and_then(|c| speed_test::profile_sni(&c.config))
+                                    .or_else(|| {
+                                        panel_snis.get(&speed_test::server_key(&name)).cloned()
+                                    });
+                                let endpoint = speed_test::resolve_profile_session_endpoint(
+                                    profile.and_then(|c| c.speedtest_base_url.as_deref()),
+                                    profile.and_then(|c| c.subscription_url.as_deref()),
+                                    sni.as_deref(),
+                                );
+                                results[i].measurement.download_mbps = None;
+                                results[i].measurement.upload_mbps = None;
+                                results[i].measurement.speed_error = None;
+                                match endpoint {
+                                    Ok(endpoint) => {
+                                        for reverse in [true, false] {
+                                            if CANCELLED.load(Ordering::Relaxed) {
+                                                break;
+                                            }
+                                            let app = app.clone();
+                                            let name = name.clone();
+                                            let endpoint = endpoint.clone();
+                                            let speed = tauri::async_runtime::spawn_blocking(move || {
+                                            let (session, expires_at) = speed_test::open_session(port, &endpoint)?;
+                                            speed_test::iperf_session(port, &session.host, session.port, expires_at, reverse, |mbps| {
+                                                let _ = app.emit("server-speed-progress", json!({"name":name,"phase":if reverse {"download"} else {"upload"},"liveMbps":mbps}));
+                                            })
+                                        }).await.map_err(|e| e.to_string()).and_then(|r| r);
+                                            match speed {
+                                                Ok(value) if reverse => {
+                                                    results[i].measurement.download_mbps =
+                                                        Some(value)
+                                                }
+                                                Ok(value) => {
+                                                    results[i].measurement.upload_mbps = Some(value)
+                                                }
+                                                Err(e) => {
+                                                    results[i].measurement.speed_error = Some(e);
+                                                    if reverse {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(error) => results[i].measurement.speed_error = Some(error),
+                                }
+                                results[i].measurement.speed_measured_at = Some(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as u64,
+                                );
+                                let _ = app.emit("server-measurement", &results[i]);
+                            }
+                        }
                     }
                     Err(e) => {
                         error!("Проверка профилей: не удалось запустить sing-box: {}", e);
                         results.extend(mapping.into_iter().map(|(name, _)| ProfileCheckResult {
+                            measurement: Measurement::default(),
                             name,
                             ok: false,
                             ip: None,
@@ -731,6 +849,7 @@ pub async fn check_profiles(
             Err(e) => {
                 error!("Проверка профилей: не удалось подготовить конфиг: {}", e);
                 results.extend(mapping.into_iter().map(|(name, _)| ProfileCheckResult {
+                    measurement: Measurement::default(),
                     name,
                     ok: false,
                     ip: None,
@@ -743,13 +862,17 @@ pub async fn check_profiles(
     let _ = stop_platform_for_profile_check(app.clone(), &state_arc).await;
     sleep(Duration::from_millis(300));
 
+    let mut restore_error = None;
     if was_running {
         if let Err(e) = singbox_start_platform(app.clone(), state.clone()).await {
             error!("Не удалось восстановить VPN после проверки профилей: {}", e);
+            restore_error = Some(format!("Не удалось восстановить VPN после замера: {e}"));
+            crate::vpn::USER_WANTS_RUNNING.store(false, Ordering::SeqCst);
         }
     } else {
         state_arc.running.store(false, Ordering::Relaxed);
     }
+    crate::vpn::emit_status(&app, restore_error.clone());
 
     let ok_count = results.iter().filter(|r| r.ok).count();
     info!(
@@ -771,5 +894,73 @@ pub async fn check_profiles(
         },
     );
 
+    if let Some(error) = restore_error {
+        return Err(error);
+    }
     Ok(results)
+}
+
+#[tauri::command]
+pub fn cancel_profile_measurement() {
+    CANCELLED.store(true, Ordering::Relaxed);
+}
+
+fn proxy_client(port: u16) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).map_err(|e| e.to_string())?)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+async fn measure_ping(port: u16) -> Result<(u64, u64, u64), String> {
+    let client = proxy_client(port)?;
+    let mut last_error = String::new();
+    for url in [
+        "https://www.gstatic.com/generate_204",
+        "https://cp.cloudflare.com/generate_204",
+    ] {
+        let mut samples = Vec::new();
+        let mut connect = 0;
+        for i in 0..6 {
+            if CANCELLED.load(Ordering::Relaxed) {
+                return Err("Замер прерван".into());
+            }
+            let start = Instant::now();
+            match client
+                .get(url)
+                .header("Cache-Control", "no-cache")
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    if let Err(e) = response.bytes().await {
+                        last_error = e.to_string();
+                        break;
+                    }
+                    let ms = start.elapsed().as_millis() as u64;
+                    if i == 0 {
+                        connect = ms;
+                    } else {
+                        samples.push(ms);
+                    }
+                }
+                Ok(response) => {
+                    last_error = format!("HTTP {}", response.status());
+                    break;
+                }
+                Err(e) => {
+                    last_error = e.to_string();
+                    break;
+                }
+            }
+        }
+        if samples.len() == 5 {
+            let jitter = samples.windows(2).map(|w| w[0].abs_diff(w[1])).sum::<u64>() / 4;
+            samples.sort();
+            return Ok((samples[2], jitter, connect));
+        }
+    }
+    Err(last_error)
 }

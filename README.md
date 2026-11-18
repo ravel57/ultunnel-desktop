@@ -4,6 +4,8 @@ This template should help get you started developing with Vue 3 in Vite. The tem
 
 Learn more about IDE Support for Vue in the [Vue Docs Scaling up Guide](https://vuejs.org/guide/scaling-up/tooling.html#ide-support).
 
+### build for macOS
+
 ```
 SIGN_IDENTITY="Developer ID Application: Petr Lomakin (ASMHMRKL3K)" \
 NOTARY=1 \
@@ -12,3 +14,9 @@ SCHEME="UltunnelPrivilegedHelper" \
 bash src-tauri/macos/bundle/package-macos.sh \
   --target <aarch64-apple-darwin/x86_64-apple-darwin>
 ```
+
+version:
+
+[Cargo.toml](src-tauri/Cargo.toml)
+
+[tauri.conf.json](src-tauri/tauri.conf.json)

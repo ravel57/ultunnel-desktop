@@ -62,8 +62,10 @@ pub struct LocalSettings {
     #[serde(default)]
     pub socks5_inbound: bool,
 
+    #[serde(default)]
     pub macos_process_tunnel_enabled: bool,
 
+    #[serde(default)]
     pub macos_tunneled_processes: Vec<String>,
 
 	#[serde(default)]
@@ -74,6 +76,102 @@ pub struct LocalSettings {
 	/// очищенный пользователем список сохраняется как [] и остаётся пустым.
 	#[serde(default = "default_dns_servers")]
 	pub dns_servers: Vec<String>,
+
+    /// Переподключаться автоматически, если ядро упало или сервер перестал отвечать.
+    #[serde(default = "default_true")]
+    pub auto_reconnect: bool,
+
+    /// Подключаться к лучшему серверу по результатам последней проверки и
+    /// переключаться на следующий, если текущий перестал работать.
+    #[serde(default)]
+    pub auto_best_server: bool,
+
+    /// Подключаться к последнему серверу сразу после запуска приложения.
+    #[serde(default)]
+    pub connect_on_launch: bool,
+
+    #[serde(default = "default_true")]
+    pub notifications_enabled: bool,
+
+    /// Фоновое обновление подписки (списка профилей).
+    #[serde(default = "default_true")]
+    pub subscription_auto_update: bool,
+
+    #[serde(default = "default_subscription_update_hours")]
+    pub subscription_update_hours: u32,
+
+    /// Unix-время (с) последнего успешного обновления подписки.
+    #[serde(default)]
+    pub subscription_updated_at: u64,
+
+    /// Локальная сеть (192.168/16, 10/8, 172.16/12 и т.п.) всегда напрямую, мимо VPN.
+    #[serde(default = "default_true")]
+    pub bypass_lan: bool,
+
+    /// Профили с результатом проверки, от лучшего к худшему (присылает UI).
+    #[serde(default)]
+    pub profile_ranking: Vec<String>,
+
+    /// Скачивать и устанавливать обновления приложения без вопросов.
+    #[serde(default = "default_true")]
+    pub auto_update: bool,
+
+    /// VPN был включён перед установкой обновления — подключиться после перезапуска.
+    #[serde(default)]
+    pub resume_vpn_after_update: bool,
+
+    /// Версия, установку которой уже пробовали при запуске (защита от цикла
+    /// «установка → перезапуск → установка», если обновление не встаёт).
+    #[serde(default)]
+    pub update_attempted_version: Option<String>,
+
+    /// Версия приложения при прошлом запуске — чтобы сообщить об успешном обновлении.
+    #[serde(default)]
+    pub last_run_version: Option<String>,
+}
+
+fn default_true() -> bool { true }
+fn default_subscription_update_hours() -> u32 { 6 }
+
+/// Настройки приложения, которые UI меняет одним объектом.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppOptions {
+    pub auto_reconnect: bool,
+    pub auto_best_server: bool,
+    pub connect_on_launch: bool,
+    pub notifications_enabled: bool,
+    pub subscription_auto_update: bool,
+    pub subscription_update_hours: u32,
+    pub bypass_lan: bool,
+    #[serde(default = "default_true")]
+    pub auto_update: bool,
+}
+
+impl LocalSettings {
+    pub fn app_options(&self) -> AppOptions {
+        AppOptions {
+            auto_reconnect: self.auto_reconnect,
+            auto_best_server: self.auto_best_server,
+            connect_on_launch: self.connect_on_launch,
+            notifications_enabled: self.notifications_enabled,
+            subscription_auto_update: self.subscription_auto_update,
+            subscription_update_hours: self.subscription_update_hours,
+            bypass_lan: self.bypass_lan,
+            auto_update: self.auto_update,
+        }
+    }
+
+    pub fn apply_app_options(&mut self, o: &AppOptions) {
+        self.auto_reconnect = o.auto_reconnect;
+        self.auto_best_server = o.auto_best_server;
+        self.connect_on_launch = o.connect_on_launch;
+        self.notifications_enabled = o.notifications_enabled;
+        self.subscription_auto_update = o.subscription_auto_update;
+        self.subscription_update_hours = o.subscription_update_hours.clamp(1, 168);
+        self.bypass_lan = o.bypass_lan;
+        self.auto_update = o.auto_update;
+    }
 }
 
 impl Default for LocalSettings {
@@ -87,6 +185,19 @@ impl Default for LocalSettings {
             macos_tunneled_processes: vec![],
 			autostart_enabled: false,
 			dns_servers: default_dns_servers(),
+            auto_reconnect: true,
+            auto_best_server: false,
+            connect_on_launch: false,
+            notifications_enabled: true,
+            subscription_auto_update: true,
+            subscription_update_hours: default_subscription_update_hours(),
+            subscription_updated_at: 0,
+            bypass_lan: true,
+            profile_ranking: vec![],
+            auto_update: true,
+            resume_vpn_after_update: false,
+            update_attempted_version: None,
+            last_run_version: None,
         }
     }
 }

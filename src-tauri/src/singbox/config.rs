@@ -23,6 +23,11 @@ use crate::settings::SplitRoutingSettings;
 use crate::singbox::CREATE_NO_WINDOW;
 use crate::singbox::diagnostics::prepare_singbox_log_file;
 use crate::singbox::dns::apply_dns_servers;
+use crate::singbox::profile_check::strip_ansi_escape_codes;
+use crate::singbox::routing::apply_direct_domains;
+use crate::singbox::routing::apply_direct_private_ips;
+use crate::singbox::routing::apply_direct_server_ips;
+use crate::singbox::routing::health_check_tags;
 use crate::singbox::routing::apply_socks5_inbound;
 use crate::singbox::routing::apply_split_routing;
 #[cfg(target_os = "macos")]
@@ -170,13 +175,15 @@ pub(crate) fn apply_singbox_logging(cfg: &mut Value, log_path: &Path) {
     );
 }
 
-/// Запускает `sing-box check` от имени пользователя, чтобы ошибки конфига
-/// (неизвестное поле, неподдерживаемый транспорт и т.п.) попали в app.log с текстом
-/// самого ядра. Запуск не блокирует: настоящий старт всё равно сообщит о сбое.
-pub(crate) fn preflight_check_config(app: &AppHandle, cfg_path: &Path) {
+/// Запускает `sing-box check` от имени пользователя до старта ядра. Ошибка конфига
+/// (неизвестный тип outbound, неизвестное поле и т.п.) прерывает запуск сразу с текстом
+/// самого ядра — иначе ядро под helper'ом падает молча, а приложение ещё 5 с ждёт Clash API.
+/// Если саму проверку выполнить не удалось (нет бинарника, ошибка ввода-вывода), запуск
+/// не блокируется: настоящий старт всё равно сообщит о сбое.
+pub(crate) fn preflight_check_config(app: &AppHandle, cfg_path: &Path) -> Result<(), String> {
     let Some(bin) = singbox_exe_path(app) else {
         warn!("Проверка конфига пропущена: бинарник sing-box не найден");
-        return;
+        return Ok(());
     };
 
     // у копии убираем секцию log, чтобы check писал ошибки в stderr и не трогал sing-box.log
@@ -193,7 +200,7 @@ pub(crate) fn preflight_check_config(app: &AppHandle, cfg_path: &Path) {
         .and_then(|s| fs::write(&check_path, s).map_err(|e| e.to_string()));
     if let Err(e) = prepared {
         warn!("Проверка конфига пропущена: не удалось подготовить копию: {}", e);
-        return;
+        return Ok(());
     }
 
     let mut cmd = Command::new(&bin);
@@ -202,12 +209,13 @@ pub(crate) fn preflight_check_config(app: &AppHandle, cfg_path: &Path) {
     cmd.creation_flags(CREATE_NO_WINDOW);
 
     let started = Instant::now();
-    match cmd.output() {
+    let result = match cmd.output() {
         Ok(out) if out.status.success() => {
             info!(
                 "Проверка конфига (sing-box check) пройдена за {} мс",
                 started.elapsed().as_millis()
             );
+            Ok(())
         }
         Ok(out) => {
             let text = format!(
@@ -220,10 +228,53 @@ pub(crate) fn preflight_check_config(app: &AppHandle, cfg_path: &Path) {
                 out.status,
                 text.trim()
             );
+            Err(describe_check_failure(&text))
         }
-        Err(e) => warn!("Не удалось выполнить sing-box check ({}): {}", bin.display(), e),
-    }
+        Err(e) => {
+            warn!("Не удалось выполнить sing-box check ({}): {}", bin.display(), e);
+            Ok(())
+        }
+    };
     let _ = fs::remove_file(&check_path);
+    result
+}
+
+/// Сообщение для пользователя из вывода `sing-box check`: без ANSI-цветов, префикса
+/// `FATAL[0000]` и пути к временному файлу, с подсказкой для неподдерживаемых протоколов.
+pub(crate) fn describe_check_failure(output: &str) -> String {
+    let clean = strip_ansi_escape_codes(output);
+    let line = clean
+        .lines()
+        .map(str::trim)
+        .find(|l| l.contains("FATAL") || l.contains("ERROR"))
+        .or_else(|| clean.lines().map(str::trim).find(|l| !l.is_empty()))
+        .unwrap_or("");
+    // "FATAL[0000] decode config at /path/file.json: outbounds[0]: ..." -> "outbounds[0]: ..."
+    let mut reason = line;
+    if let Some(i) = reason.find(']') {
+        if reason[..i].contains("FATAL") || reason[..i].contains("ERROR") {
+            reason = reason[i + 1..].trim_start();
+        }
+    }
+    if let Some(rest) = reason.strip_prefix("decode config at ") {
+        if let Some(i) = rest.find(".json: ") {
+            reason = &rest[i + ".json: ".len()..];
+        }
+    }
+    let reason = if reason.is_empty() { "неизвестная ошибка" } else { reason };
+
+    if reason.contains("naive outbound is not included in this build") {
+        "В ядре sing-box нет поддержки Naive. Нужен бинарник с тегом with_naive_outbound".into()
+    } else if reason.contains("unknown outbound type")
+        || reason.contains("unknown endpoint type")
+        || reason.contains("unknown field")
+    {
+        format!(
+            "Профиль использует возможность, которой нет во встроенном ядре sing-box ({reason}). Обновите приложение"
+        )
+    } else {
+        format!("Ядро sing-box отклонило конфиг профиля: {reason}")
+    }
 }
 
 /// Краткое описание конфига для лога. Намеренно без адресов, паролей и ключей —
@@ -296,6 +347,24 @@ pub(crate) fn write_singbox_config(
         &settings.split_routing.proxy_outbound,
     );
     apply_dns_servers(&mut v, &settings.dns_servers);
+    // последним: правило должно стоять выше пользовательских и серверных правил на proxy
+    // панель и сервер обновлений — мимо VPN: работают, даже если сервер VPN недоступен
+    let mut direct_hosts = vec![crate::api::API_HOST];
+    direct_hosts.extend(crate::updater::UPDATE_HOST);
+    apply_direct_domains(&mut v, &direct_hosts);
+    info!("Домены {:?} направлены мимо VPN", direct_hosts);
+    // защита от петли: трафик к самим прокси-серверам, попавший в TUN, идёт напрямую
+    let (server_ips, server_domains) = apply_direct_server_ips(&mut v);
+    info!(
+        "IP прокси-серверов направлены мимо VPN: {} (доменных имён серверов пропущено: {})",
+        server_ips, server_domains
+    );
+    if settings.bypass_lan {
+        apply_direct_private_ips(&mut v);
+        info!("Локальная сеть (частные диапазоны IP) направлена мимо VPN");
+    }
+    let (proxy_tag, direct_tag) = health_check_tags(&v);
+    crate::vpn::set_health_tags(proxy_tag, direct_tag);
     ensure_clash_api(&mut v);
     if let Some(log_path) = prepare_singbox_log_file(app) {
         apply_singbox_logging(&mut v, &log_path);
@@ -377,5 +446,40 @@ pub(crate) fn patch_config_for_macos(cfg: &mut Value) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::describe_check_failure;
+
+    #[test]
+    fn check_failure_unknown_outbound_type() {
+        let out = "\x1b[31mFATAL\x1b[0m[0000] decode config at /Users/x/singbox-preflight.json: outbounds[0]: unknown outbound type: masque\n";
+        let msg = describe_check_failure(out);
+        assert!(msg.contains("(outbounds[0]: unknown outbound type: masque)"), "{msg}");
+        assert!(msg.contains("Обновите приложение"), "{msg}");
+        assert!(!msg.contains("singbox-preflight"), "{msg}");
+        assert!(!msg.contains('\x1b'), "{msg}");
+    }
+
+    #[test]
+    fn check_failure_unknown_field() {
+        let out = "FATAL[0000] decode config at C:\\Users\\x\\singbox-preflight.json: endpoints[0].content_padding_addition: json: unknown field \"content_padding_addition\"";
+        let msg = describe_check_failure(out);
+        assert!(msg.contains("встроенном ядре"), "{msg}");
+        assert!(msg.starts_with("Профиль использует"), "{msg}");
+        assert!(msg.contains("endpoints[0].content_padding_addition"), "{msg}");
+    }
+
+    #[test]
+    fn check_failure_other_and_naive() {
+        let msg = describe_check_failure("FATAL[0000] initialize outbound[0]: missing server address");
+        assert_eq!(msg, "Ядро sing-box отклонило конфиг профиля: initialize outbound[0]: missing server address");
+
+        let msg = describe_check_failure("FATAL[0000] create outbound[0]: naive outbound is not included in this build, rebuild with -tags with_naive_outbound");
+        assert!(msg.contains("with_naive_outbound") && msg.contains("Naive"), "{msg}");
+
+        assert_eq!(describe_check_failure(""), "Ядро sing-box отклонило конфиг профиля: неизвестная ошибка");
     }
 }
