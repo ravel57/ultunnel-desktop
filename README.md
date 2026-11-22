@@ -15,6 +15,8 @@ bash src-tauri/macos/bundle/package-macos.sh \
   --target <aarch64-apple-darwin/x86_64-apple-darwin>
 ```
 
+---
+
 version:
 
 [Cargo.toml](src-tauri/Cargo.toml)

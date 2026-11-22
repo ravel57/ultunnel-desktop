@@ -99,6 +99,11 @@ int smjobbless_install(const char *label_c, char **error_out) {
              appPath:(NSString *)appPath
                  uid:(int32_t)uid
                reply:(void (^)(int32_t code, NSString *msg))reply;
+
+- (void)setSystemDns:(NSString *)servers
+               reply:(void (^)(int32_t code, NSString *msg))reply;
+
+- (void)restoreSystemDnsWithReply:(void (^)(int32_t code, NSString *msg))reply;
 @end
 
 
@@ -235,6 +240,57 @@ int smhelper_start_singbox(const char *label_c,
       [remote startSingBox:sing configPath:cfg argsJson:argsJ reply:^(int32_t code, NSString *msg) {
         BOOL success = (code == 0);
         done(success, msg ?: @"");
+      }];
+    }, error_out);
+  }
+}
+
+// Проверка, что helper реально зарегистрирован в launchd и отвечает. Файл в
+// /Library/PrivilegedHelperTools может существовать без загруженного LaunchDaemon —
+// тогда любой вызов сразу заканчивается "XPC invalidated".
+int smhelper_ping(const char *label_c, char **error_out) {
+  @autoreleasepool {
+    NSString *label = toNSString(label_c);
+    if (!label.length) {
+      if (error_out) *error_out = dupCString(@"Empty helper label");
+      return 0;
+    }
+
+    return call_helper(label, ^(id<UltunnelPrivilegedHelperProtocol> remote, void (^done)(BOOL ok, NSString *err)) {
+      [remote pingWithReply:^(__unused NSString *msg) {
+        done(YES, nil);
+      }];
+    }, error_out);
+  }
+}
+
+// servers — адреса через запятую. Helper сохраняет прежние DNS и вернёт их в restore.
+int smhelper_set_system_dns(const char *label_c, const char *servers_c, char **error_out) {
+  @autoreleasepool {
+    NSString *label = toNSString(label_c);
+    NSString *servers = toNSString(servers_c);
+    if (!label.length || !servers.length) {
+      if (error_out) *error_out = dupCString(@"label/servers is empty");
+      return 0;
+    }
+    return call_helper(label, ^(id<UltunnelPrivilegedHelperProtocol> remote, void (^done)(BOOL ok, NSString *err)) {
+      [remote setSystemDns:servers reply:^(int32_t code, NSString *msg) {
+        done(code == 0, msg ?: @"");
+      }];
+    }, error_out);
+  }
+}
+
+int smhelper_restore_system_dns(const char *label_c, char **error_out) {
+  @autoreleasepool {
+    NSString *label = toNSString(label_c);
+    if (!label.length) {
+      if (error_out) *error_out = dupCString(@"Empty helper label");
+      return 0;
+    }
+    return call_helper(label, ^(id<UltunnelPrivilegedHelperProtocol> remote, void (^done)(BOOL ok, NSString *err)) {
+      [remote restoreSystemDnsWithReply:^(int32_t code, NSString *msg) {
+        done(code == 0, msg ?: @"");
       }];
     }, error_out);
   }

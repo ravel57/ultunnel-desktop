@@ -11,14 +11,15 @@ use crate::state::SharedState;
 
 /// Разбор пользовательского DNS-сервера в описание сервера sing-box.
 /// Форматы: `1.1.1.1`, `1.1.1.1:5353`, `udp://…`, `tcp://…`, `tls://host[:port]`,
-/// `https://host[:port][/path]`. Без схемы — обычный UDP.
+/// `https://host[:port][/path]`. Без схемы — TCP, если сервер идёт через прокси,
+/// и UDP для локальных адресов.
 pub(crate) fn parse_dns_server(entry: &str, tag: &str) -> Result<Value, String> {
     let entry = entry.trim();
     let bad = |why: &str| format!("Некорректный DNS сервер {:?}: {}", entry, why);
 
-    let (kind, rest) = match entry.split_once("://") {
-        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
-        None => ("udp".to_string(), entry),
+    let (mut kind, rest, explicit_scheme) = match entry.split_once("://") {
+        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest, true),
+        None => ("udp".to_string(), entry, false),
     };
     let default_port: u16 = match kind.as_str() {
         "udp" | "tcp" => 53,
@@ -80,6 +81,14 @@ pub(crate) fn parse_dns_server(entry: &str, tag: &str) -> Result<Value, String> 
         Some(std::net::IpAddr::V6(v6)) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
         None => false,
     };
+
+    // Многие прокси не пропускают UDP: у naive его нет совсем, у shadowsocks-серверов
+    // часто выключен UDP-релей. Тогда DNS по UDP через прокси молча не работает
+    // (сайты по IP открываются, по имени — нет). DNS по TCP проходит через любой прокси,
+    // поэтому адрес без схемы, идущий через прокси, отправляем по TCP. Явный udp:// не трогаем.
+    if !explicit_scheme && !local {
+        kind = "tcp".to_string();
+    }
 
     let mut server = Map::new();
     server.insert("type".into(), json!(kind));
@@ -223,11 +232,15 @@ mod tests {
 
     #[test]
     fn parses_dns_server_formats() {
-        let udp = parse_dns_server("1.1.1.1", "t").unwrap();
+        // без схемы и через прокси — TCP (UDP через прокси часто не проходит)
+        let bare = parse_dns_server("1.1.1.1", "t").unwrap();
+        assert_eq!(bare["type"], "tcp");
+        assert_eq!(bare["server"], "1.1.1.1");
+        assert_eq!(bare["detour"], "proxy");
+        assert!(bare.get("server_port").is_none());
+
+        let udp = parse_dns_server("udp://1.1.1.1", "t").unwrap();
         assert_eq!(udp["type"], "udp");
-        assert_eq!(udp["server"], "1.1.1.1");
-        assert_eq!(udp["detour"], "proxy");
-        assert!(udp.get("server_port").is_none());
 
         let dot = parse_dns_server("tls://dns.google", "t").unwrap();
         assert_eq!(dot["type"], "tls");
@@ -244,6 +257,7 @@ mod tests {
 
         let lan = parse_dns_server("192.168.1.1", "t").unwrap();
         assert!(lan.get("detour").is_none());
+        assert_eq!(lan["type"], "udp");
     }
 
     #[test]

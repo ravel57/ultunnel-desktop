@@ -786,11 +786,64 @@ pub(crate) fn apply_direct_server_ips(cfg: &mut Value) -> (usize, usize) {
         return (0, domains);
     }
     let count = cidrs.len();
+    exclude_from_tun_routes(root, &cidrs);
     let direct_tag = ensure_direct_outbound(root);
     let rules = route_rules_mut(root);
     // правило по IP, sniff ему не нужен
     insert_rule_after_sniff(rules, json!({ "ip_cidr": cidrs, "outbound": direct_tag }), false);
     (count, domains)
+}
+
+/// Исключает адреса из маршрутов TUN (`route_exclude_address`): пакеты к ним идут по
+/// системной таблице маршрутизации мимо TUN, независимо от привязки сокета к интерфейсу.
+/// Одного правила `ip_cidr → direct` мало: на части машин (замечено на Intel Mac с
+/// macOS 12) не привязывается и сам direct, его соединение снова попадает в TUN, и петля
+/// продолжается до "too many open files". Существующие адреса профиля сохраняются.
+fn exclude_from_tun_routes(root: &mut Map<String, Value>, cidrs: &[String]) {
+    let Some(inbounds) = root.get_mut("inbounds").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for ib in inbounds.iter_mut() {
+        if ib.get("type").and_then(|t| t.as_str()) != Some("tun") {
+            continue;
+        }
+        let Some(obj) = ib.as_object_mut() else { continue };
+        let list = obj
+            .entry("route_exclude_address".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if !list.is_array() {
+            *list = Value::Array(Vec::new());
+        }
+        let arr = list.as_array_mut().unwrap();
+        for c in cidrs {
+            if !arr.iter().any(|v| v.as_str() == Some(c.as_str())) {
+                arr.push(Value::String(c.clone()));
+            }
+        }
+    }
+}
+
+/// Адрес DNS внутри TUN: следующий после адреса интерфейса в первой IPv4-подсети
+/// tun-inbound'а (198.18.0.1/30 → 198.18.0.2). sing-box перехватывает DNS-пакеты,
+/// пришедшие в TUN (hijack-dns), так что на этот адрес можно направить системный DNS.
+pub(crate) fn tun_dns_address(cfg: &Value) -> Option<String> {
+    let inbounds = cfg.get("inbounds")?.as_array()?;
+    let tun = inbounds
+        .iter()
+        .find(|ib| ib.get("type").and_then(|t| t.as_str()) == Some("tun"))?;
+    let mut candidates: Vec<&str> = Vec::new();
+    for key in ["address", "inet4_address"] {
+        match tun.get(key) {
+            Some(Value::Array(a)) => candidates.extend(a.iter().filter_map(|v| v.as_str())),
+            Some(Value::String(s)) => candidates.push(s),
+            _ => {}
+        }
+    }
+    candidates.into_iter().find_map(|c| {
+        let ip: std::net::Ipv4Addr = c.split('/').next()?.trim().parse().ok()?;
+        let next = u32::from(ip).checked_add(1)?;
+        Some(std::net::Ipv4Addr::from(next).to_string())
+    })
 }
 
 /// Локальная сеть мимо VPN: адреса из частных диапазонов (192.168/16, 10/8, 172.16/12,
@@ -962,6 +1015,37 @@ mod tests {
         assert_eq!(rule["ip_cidr"], json!(["84.201.147.52/32", "2001:db8::1/128"]));
         assert_eq!(rule["outbound"], "direct");
         assert_eq!(cfg["outbounds"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn server_ips_are_excluded_from_tun_routes() {
+        let mut cfg = json!({
+            "inbounds": [
+                { "type": "tun", "tag": "tun-in", "route_exclude_address": ["10.1.0.0/16", "84.201.147.52/32"] },
+                { "type": "socks", "tag": "socks-in" }
+            ],
+            "outbounds": [{ "type": "naive", "tag": "proxy", "server": "84.201.147.52" },
+                          { "type": "trojan", "tag": "p2", "server": "192.0.2.10" }]
+        });
+        apply_direct_server_ips(&mut cfg);
+        apply_direct_server_ips(&mut cfg);
+        assert_eq!(
+            cfg["inbounds"][0]["route_exclude_address"],
+            json!(["10.1.0.0/16", "84.201.147.52/32", "192.0.2.10/32"])
+        );
+        assert!(cfg["inbounds"][1].get("route_exclude_address").is_none());
+    }
+
+    #[test]
+    fn tun_dns_address_is_next_ipv4() {
+        let cfg = json!({ "inbounds": [
+            { "type": "socks", "tag": "socks-in" },
+            { "type": "tun", "address": ["fdfe:dcba:9876::1/126", "198.18.0.1/30"] }
+        ]});
+        assert_eq!(tun_dns_address(&cfg).as_deref(), Some("198.18.0.2"));
+        let legacy = json!({ "inbounds": [{ "type": "tun", "inet4_address": "172.19.0.1/30" }] });
+        assert_eq!(tun_dns_address(&legacy).as_deref(), Some("172.19.0.2"));
+        assert_eq!(tun_dns_address(&json!({ "inbounds": [{ "type": "socks" }] })), None);
     }
 
     #[test]

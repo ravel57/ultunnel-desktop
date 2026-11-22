@@ -248,10 +248,127 @@ private func plistXml(label: String, appExecPath: String) -> String {
     """
 }
 
+// MARK: - System DNS
+
+/// Подмена системного DNS на время работы VPN. На macOS DNS часто указывает на роутер
+/// (192.168.x.x): запросы к нему идут по маршруту локальной сети мимо TUN, и если роутер
+/// или провайдер блокирует домены (NXDOMAIN), сайты не открываются, хотя туннель работает.
+/// Прежние настройки каждого сетевого сервиса сохраняются в файл и возвращаются при
+/// остановке VPN, а также при старте helper'а (после падения приложения или перезагрузки).
+final class SystemDns {
+    private let q = DispatchQueue(label: "ru.ravel.ultunnel.helper.dns")
+    private let backupDir = "/Library/Application Support/ru.ravel.ultunnel-macos"
+    private var backupPath: String { backupDir + "/dns-backup.json" }
+    private let networksetup = "/usr/sbin/networksetup"
+
+    var hasBackup: Bool { FileManager.default.fileExists(atPath: backupPath) }
+
+    private func services() -> [String] {
+        guard let (_, out) = try? runCapture(networksetup, ["-listallnetworkservices"]) else { return [] }
+        return out.split(separator: "\n").dropFirst()            // первая строка — пояснение про '*'
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("*") }          // '*' — выключенный сервис
+    }
+
+    private func currentServers(_ service: String) -> [String] {
+        guard let (code, out) = try? runCapture(networksetup, ["-getdnsservers", service]), code == 0 else { return [] }
+        if out.contains("aren't any DNS Servers") { return [] }
+        return out.split(separator: "\n")
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.contains(" ") }
+    }
+
+    private func apply(_ service: String, _ servers: [String]) -> Bool {
+        let args = ["-setdnsservers", service] + (servers.isEmpty ? ["Empty"] : servers)
+        let r = try? runCapture(networksetup, args)
+        return r?.0 == 0
+    }
+
+    private func flushCache() {
+        _ = try? runCapture("/usr/bin/dscacheutil", ["-flushcache"])
+        _ = try? runCapture("/usr/bin/killall", ["-HUP", "mDNSResponder"])
+    }
+
+    func set(_ servers: [String]) -> (Int32, String) {
+        q.sync {
+            let list = services()
+            if list.isEmpty { return (1, "no network services found") }
+            // Бэкап пишем только если его ещё нет: после падения в нём лежат исходные
+            // настройки, а не наши 198.18.0.x.
+            if !hasBackup {
+                var backup: [String: [String]] = [:]
+                for svc in list { backup[svc] = currentServers(svc) }
+                do {
+                    try FileManager.default.createDirectory(atPath: backupDir, withIntermediateDirectories: true)
+                    let data = try JSONSerialization.data(withJSONObject: backup, options: [.prettyPrinted, .sortedKeys])
+                    try data.write(to: URL(fileURLWithPath: backupPath), options: .atomic)
+                } catch {
+                    return (2, "cannot save DNS backup: \(error)")
+                }
+            }
+            var failed: [String] = []
+            for svc in list where !apply(svc, servers) { failed.append(svc) }
+            flushCache()
+            log.info("system DNS set to \(servers.joined(separator: ","), privacy: .public) on \(list.count - failed.count) services")
+            if failed.count == list.count { return (3, "networksetup failed for all services") }
+            return (0, failed.isEmpty ? "ok" : "ok, failed: \(failed.joined(separator: ", "))")
+        }
+    }
+
+    func restore() -> (Int32, String) {
+        q.sync {
+            guard let data = FileManager.default.contents(atPath: backupPath) else { return (0, "nothing to restore") }
+            guard let backup = (try? JSONSerialization.jsonObject(with: data)) as? [String: [String]] else {
+                try? FileManager.default.removeItem(atPath: backupPath)
+                return (1, "DNS backup is corrupted, removed")
+            }
+            let existing = Set(services())
+            var failed: [String] = []
+            for (svc, servers) in backup where existing.contains(svc) {
+                if !apply(svc, servers) { failed.append(svc) }
+            }
+            try? FileManager.default.removeItem(atPath: backupPath)
+            flushCache()
+            log.info("system DNS restored for \(backup.count) services")
+            return (failed.isEmpty ? 0 : 2, failed.isEmpty ? "restored" : "restore failed: \(failed.joined(separator: ", "))")
+        }
+    }
+}
+
 // MARK: - XPC Helper
 
 final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
     private let runner = SingBoxRunner()
+    private let dns = SystemDns()
+
+    override init() {
+        super.init()
+        // helper стартует при загрузке системы и после падения: если остался бэкап DNS,
+        // а sing-box не запущен — VPN не работает, возвращаем пользователю его DNS.
+        if dns.hasBackup && !runner.isRunning().0 {
+            let (_, msg) = dns.restore()
+            log.info("startup DNS restore: \(msg, privacy: .public)")
+        }
+    }
+
+    @objc(setSystemDns:reply:)
+    func setSystemDns(_ servers: String, reply: @escaping (Int32, String) -> Void) {
+        let list = servers.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        if list.isEmpty || list.contains(where: { $0.rangeOfCharacter(from: CharacterSet(charactersIn: "0123456789abcdefABCDEF.:").inverted) != nil }) {
+            reply(1, "invalid DNS server list: \(servers)")
+            return
+        }
+        let (code, msg) = dns.set(list)
+        reply(code, msg)
+    }
+
+    @objc(restoreSystemDnsWithReply:)
+    func restoreSystemDnsWithReply(_ reply: @escaping (Int32, String) -> Void) {
+        let (code, msg) = dns.restore()
+        reply(code, msg)
+    }
 
     @objc(pingWithReply:)
     func pingWithReply(_ reply: @escaping (String) -> Void) {
@@ -277,7 +394,10 @@ final class Helper: NSObject, UltunnelPrivilegedHelperProtocol {
 
     @objc(stopSingBoxWithReply:)
     func stopSingBoxWithReply(_ reply: @escaping (Int32, String) -> Void) {
-        reply(0, runner.stop())
+        let msg = runner.stop()
+        // VPN остановлен — DNS через TUN больше не отвечает, возвращаем прежний.
+        _ = dns.restore()
+        reply(0, msg)
     }
 
     @objc(statusWithReply:)

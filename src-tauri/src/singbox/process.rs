@@ -108,6 +108,33 @@ pub async fn singbox_start_root(
     }
 }
 
+/// Направляет системный DNS macOS в TUN на время работы VPN. Без этого DNS часто
+/// остаётся на роутере (192.168.x.x): запросы к нему идут мимо TUN по маршруту
+/// локальной сети, и блокировки роутера/провайдера (NXDOMAIN) ломают сайты при
+/// работающем туннеле. Прежний DNS helper сохраняет и возвращает при остановке
+/// sing-box (stopSingBox) или при своём старте после сбоя. Ошибка не мешает VPN.
+#[cfg(target_os = "macos")]
+fn set_system_dns_to_tun(cfg_path: &std::path::Path) {
+    let cfg: serde_json::Value = match std::fs::read_to_string(cfg_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+    {
+        Some(v) => v,
+        None => {
+            warn!("Системный DNS не изменён: не удалось прочитать конфиг {}", cfg_path.display());
+            return;
+        }
+    };
+    let Some(dns) = crate::singbox::routing::tun_dns_address(&cfg) else {
+        info!("Системный DNS не изменён: в конфиге нет TUN с IPv4-адресом");
+        return;
+    };
+    match macos_smjobbless::helper_set_system_dns(HELPER_LABEL, &[dns.clone()]) {
+        Ok(()) => info!("Системный DNS направлен в TUN: {}", dns),
+        Err(e) => warn!("Не удалось направить системный DNS в TUN ({}): {}", dns, e),
+    }
+}
+
 // #[tauri::command]
 pub(crate) async fn singbox_stop_root(app: AppHandle) -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
@@ -462,6 +489,7 @@ pub async fn singbox_start_platform(app: AppHandle, state: SharedState<'_>) -> R
         }
 
         state.running.store(true, Ordering::Relaxed);
+        set_system_dns_to_tun(&cfg_path);
         info!("VPN запущен (профиль {:?}) за {} мс", selected, started.elapsed().as_millis());
         return Ok(());
     }

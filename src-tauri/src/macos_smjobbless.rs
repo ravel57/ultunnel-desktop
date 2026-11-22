@@ -14,6 +14,12 @@ extern "C" {
 
 	fn smhelper_stop_singbox(label: *const i8, error_out: *mut *mut i8) -> i32;
 
+	fn smhelper_ping(label: *const i8, error_out: *mut *mut i8) -> i32;
+
+	fn smhelper_set_system_dns(label: *const i8, servers: *const i8, error_out: *mut *mut i8) -> i32;
+
+	fn smhelper_restore_system_dns(label: *const i8, error_out: *mut *mut i8) -> i32;
+
 	fn smhelper_free(p: *mut core::ffi::c_void);
 
 	fn smhelper_set_autostart(
@@ -77,6 +83,42 @@ pub fn helper_start_singbox(label: &str, singbox_path: &Path, config_path: &Path
 		let msg = take_err(err).unwrap_or_else(|| "helper startSingBox failed (no error)".to_string());
 		tracing::error!("Helper: startSingBox вернул ошибку: {}", msg);
 		Err(msg)
+	}
+}
+
+pub fn helper_ping(label: &str) -> Result<(), String> {
+	let c_label = CString::new(label).map_err(|e| e.to_string())?;
+	let mut err: *mut i8 = core::ptr::null_mut();
+	let ok = unsafe { smhelper_ping(c_label.as_ptr(), &mut err) } != 0;
+	if ok {
+		Ok(())
+	} else {
+		Err(take_err(err).unwrap_or_else(|| "helper ping failed (no error)".to_string()))
+	}
+}
+
+/// Ставит системный DNS всех сетевых сервисов (helper сохраняет прежний).
+pub fn helper_set_system_dns(label: &str, servers: &[String]) -> Result<(), String> {
+	let c_label = CString::new(label).map_err(|e| e.to_string())?;
+	let c_servers = CString::new(servers.join(",")).map_err(|e| e.to_string())?;
+	let mut err: *mut i8 = core::ptr::null_mut();
+	let ok = unsafe { smhelper_set_system_dns(c_label.as_ptr(), c_servers.as_ptr(), &mut err) } != 0;
+	if ok {
+		Ok(())
+	} else {
+		Err(take_err(err).unwrap_or_else(|| "helper setSystemDns failed (no error)".to_string()))
+	}
+}
+
+/// Возвращает системный DNS, сохранённый helper'ом при `helper_set_system_dns`.
+pub fn helper_restore_system_dns(label: &str) -> Result<(), String> {
+	let c_label = CString::new(label).map_err(|e| e.to_string())?;
+	let mut err: *mut i8 = core::ptr::null_mut();
+	let ok = unsafe { smhelper_restore_system_dns(c_label.as_ptr(), &mut err) } != 0;
+	if ok {
+		Ok(())
+	} else {
+		Err(take_err(err).unwrap_or_else(|| "helper restoreSystemDns failed (no error)".to_string()))
 	}
 }
 

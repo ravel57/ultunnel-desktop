@@ -33,4 +33,13 @@ protocol UltunnelPrivilegedHelperProtocol: NSObjectProtocol {
     reply: @escaping (Int32, String) -> Void
     )
 
+    // selector: setSystemDns:reply:
+    // servers — адреса через запятую. Прежние DNS сохраняются и возвращаются restoreSystemDns.
+    @objc(setSystemDns:reply:)
+    func setSystemDns(_ servers: String, reply: @escaping (Int32, String) -> Void)
+
+    // selector: restoreSystemDnsWithReply:
+    @objc(restoreSystemDnsWithReply:)
+    func restoreSystemDnsWithReply(_ reply: @escaping (Int32, String) -> Void)
+
 }
