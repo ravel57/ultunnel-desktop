@@ -19,7 +19,13 @@ case "$triple" in
 	aarch64-unknown-linux-gnu) goos=linux;   goarch=arm64; ext="" ;;
 	*) echo "Unsupported target triple: $triple" >&2; exit 1 ;;
 esac
-tags="$(tr -d '\r\n' < "$core_dir/release/DEFAULT_BUILD_TAGS_OTHERS"),with_naive_outbound"
+# На Windows naive (cronet) работает только через purego + libcronet.dll — эти теги
+# (with_purego, with_naive_outbound) уже есть в DEFAULT_BUILD_TAGS_WINDOWS.
+if [[ "$goos" == windows ]]; then
+	tags="$(tr -d '\r\n' < "$core_dir/release/DEFAULT_BUILD_TAGS_WINDOWS")"
+else
+	tags="$(tr -d '\r\n' < "$core_dir/release/DEFAULT_BUILD_TAGS_OTHERS"),with_naive_outbound"
+fi
 out="$desktop_dir/src-tauri/bin/sing-box-$triple$ext"
 mkdir -p "$desktop_dir/src-tauri/bin"
 cd "$core_dir"
@@ -36,8 +42,10 @@ if [[ "$goos" == darwin ]]; then
 	export CGO_CFLAGS="${CGO_CFLAGS:-} -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
 	export CGO_LDFLAGS="${CGO_LDFLAGS:-} -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
 fi
+# Общие флаги линковки форка, как в его Makefile (-checklinkname=0 нужен tfo-go на Windows).
+ldflags_shared="$(tr -d '\r\n' < "$core_dir/release/LDFLAGS" 2>/dev/null || true)"
 GOOS="$goos" GOARCH="$goarch" go build -tags "$tags" \
-	-ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$version'" \
+	-ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$version' $ldflags_shared" \
 	-o "$out" ./cmd/sing-box
 if [[ "$goos" == darwin ]] && command -v lipo >/dev/null; then
 	actual="$(lipo -archs "$out")"
