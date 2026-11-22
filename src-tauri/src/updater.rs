@@ -1,4 +1,4 @@
-//! Обновление приложения: проверка версии на win/mac.ultunnel.ru, скачивание сборки
+//! Обновление приложения: проверка версии на win/mac/mac-x64.ultunnel.ru, скачивание сборки
 //! с проверкой sha256, установка (Windows — NSIS/MSI, macOS — замена .app из DMG)
 //! и тихое автообновление в фоне.
 //!
@@ -37,8 +37,12 @@ use crate::vpn::unix_now;
 /// Хост раздачи сборок для текущей платформы.
 #[cfg(target_os = "windows")]
 pub(crate) const UPDATE_HOST: Option<&str> = Some("win.ultunnel.ru");
-#[cfg(target_os = "macos")]
+// Сборки под Apple Silicon и Intel раздаются с разных хостов: приложение должно
+// получать обновление своей архитектуры (x86_64-сборка с arm64-ядром не запустится).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) const UPDATE_HOST: Option<&str> = Some("mac.ultunnel.ru");
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+pub(crate) const UPDATE_HOST: Option<&str> = Some("mac-x64.ultunnel.ru");
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub(crate) const UPDATE_HOST: Option<&str> = None;
 
