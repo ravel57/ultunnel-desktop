@@ -1,5 +1,5 @@
 //! Обновление приложения: проверка версии на win/mac/mac-x64.ultunnel.ru, скачивание сборки
-//! с проверкой sha256, установка (Windows — NSIS/MSI, macOS — замена .app из DMG)
+//! с проверкой sha256, установка (Windows — portable ZIP или NSIS/MSI, macOS — замена .app из DMG)
 //! и тихое автообновление в фоне.
 //!
 //! Версия приложения задаётся в `src-tauri/tauri.conf.json` (поле `version`).
@@ -297,8 +297,9 @@ pub(crate) async fn check(app: &AppHandle) -> Result<UpdateState, String> {
 // Скачивание
 // ---------------------------------------------------------------------------
 
+// Первое расширение — сборка по умолчанию: на Windows приложение раздаётся portable-архивом.
 #[cfg(target_os = "windows")]
-const ALLOWED_EXTENSIONS: &[&str] = &["exe", "msi"];
+const ALLOWED_EXTENSIONS: &[&str] = &["zip", "exe", "msi"];
 #[cfg(target_os = "macos")]
 const ALLOWED_EXTENSIONS: &[&str] = &["dmg"];
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -515,9 +516,147 @@ fn launch_installer(path: &Path, silent: bool) -> Result<(), String> {
                 .spawn()
                 .map_err(|e| format!("Не удалось запустить msiexec: {e}"))?;
         }
+        "zip" => win_zip::apply(path)?,
         other => return Err(format!("Неподдерживаемый установщик: .{other}")),
     }
     Ok(())
+}
+
+/// Обновление portable-сборки из ZIP (ultunnel-desktop.exe, sing-box.exe, libcronet.dll…).
+/// Запущенный .exe на Windows нельзя перезаписать, поэтому файлы копирует отдельный
+/// PowerShell-скрипт после выхода приложения, а затем запускает новую версию.
+#[cfg(target_os = "windows")]
+mod win_zip {
+    use std::os::windows::process::CommandExt;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use tracing::info;
+
+    /// Где лежит распакованная сборка: в корне архива или в единственной папке внутри.
+    pub(super) fn find_root(dir: &Path, exe_name: &str) -> Option<PathBuf> {
+        if dir.join(exe_name).is_file() {
+            return Some(dir.to_path_buf());
+        }
+        let subdirs: Vec<PathBuf> = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        match subdirs.as_slice() {
+            [only] if only.join(exe_name).is_file() => Some(only.clone()),
+            _ => None,
+        }
+    }
+
+    /// Строка для PowerShell в одинарных кавычках.
+    pub(super) fn ps_quote(p: &Path) -> String {
+        format!("'{}'", p.to_string_lossy().replace('\'', "''"))
+    }
+
+    pub(super) fn script(pid: u32, src: &Path, dst: &Path, exe: &Path, log: &Path) -> String {
+        format!(
+            r#"$ErrorActionPreference = 'Stop'
+$appPid = {pid}
+$src = [IO.Path]::GetFullPath({src}).TrimEnd('\\')
+$dst = {dst}
+$exe = {exe}
+$log = {log}
+function Log($m) {{ try {{ Add-Content -LiteralPath $log -Value ((Get-Date -Format s) + ' ' + $m) -Encoding UTF8 }} catch {{}} }}
+$elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+try {{
+    Wait-Process -Id $appPid -Timeout 60 -ErrorAction SilentlyContinue
+    # Папка в Program Files и т.п. — без прав администратора записать нельзя: перезапускаемся с UAC.
+    $probe = Join-Path $dst ('.ultunnel-update-' + [guid]::NewGuid().ToString('N'))
+    try {{ [IO.File]::WriteAllText($probe, ''); Remove-Item -LiteralPath $probe -Force }}
+    catch {{
+        if (-not $elevated) {{
+            Log 'no write access, requesting elevation'
+            Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File',('"' + $PSCommandPath + '"'))
+            exit
+        }}
+        throw
+    }}
+    $files = Get-ChildItem -LiteralPath $src -Recurse -File | Where-Object {{ $_.Extension -ne '.pdb' }}
+    foreach ($f in $files) {{
+        $rel = $f.FullName.Substring($src.Length).TrimStart('\')
+        $target = [IO.Path]::Combine($dst, $rel)
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target))
+        # sing-box.exe/libcronet.dll могут освобождаться не сразу после остановки VPN
+        for ($i = 0; $i -lt 40; $i++) {{
+            try {{ [IO.File]::Copy($f.FullName, $target, $true); break }}
+            catch {{ if ($i -eq 39) {{ throw }}; Start-Sleep -Milliseconds 500 }}
+        }}
+    }}
+    Log ('updated ' + $files.Count + ' files in ' + $dst)
+    Remove-Item -LiteralPath $src -Recurse -Force -ErrorAction SilentlyContinue
+}} catch {{
+    Log ('update failed: ' + $_)
+}}
+# Из повышенного скрипта запускаем приложение через explorer, чтобы оно не стало администратором.
+if ($elevated) {{ Start-Process explorer.exe -ArgumentList ('"' + $exe + '"') }} else {{ Start-Process -FilePath $exe }}
+"#,
+            src = ps_quote(src),
+            dst = ps_quote(dst),
+            exe = ps_quote(exe),
+            log = ps_quote(log),
+        )
+    }
+
+    pub fn apply(zip: &Path) -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe_name = exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("Не удалось определить имя исполняемого файла")?
+            .to_string();
+        let install_dir = exe.parent().ok_or("Не удалось определить папку приложения")?.to_path_buf();
+        let work = zip.parent().ok_or("Некорректный путь к архиву")?;
+        let extract = work.join("extracted");
+        let _ = std::fs::remove_dir_all(&extract);
+        std::fs::create_dir_all(&extract).map_err(|e| format!("Не удалось создать папку распаковки: {e}"))?;
+
+        // tar.exe (bsdtar) есть в Windows 10 1803+ и понимает ZIP.
+        let tar = std::env::var_os("SystemRoot")
+            .map(|r| PathBuf::from(r).join("System32").join("tar.exe"))
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| PathBuf::from("tar.exe"));
+        let out = Command::new(&tar)
+            .arg("-xf")
+            .arg(zip)
+            .arg("-C")
+            .arg(&extract)
+            .creation_flags(crate::singbox::CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("Не удалось распаковать архив ({}): {e}", tar.display()))?;
+        if !out.status.success() {
+            return Err(format!(
+                "Не удалось распаковать архив обновления: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let root = find_root(&extract, &exe_name)
+            .ok_or_else(|| format!("В архиве обновления нет {exe_name}"))?;
+
+        let log = work.join("update.log");
+        let script_path = work.join("apply-update.ps1");
+        let body = script(std::process::id(), &root, &install_dir, &exe, &log);
+        // UTF-8 с BOM: иначе Windows PowerShell 5.1 прочитает кириллицу в путях как ANSI.
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(body.as_bytes());
+        std::fs::write(&script_path, bytes).map_err(|e| format!("Не удалось записать скрипт обновления: {e}"))?;
+
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"])
+            .arg(&script_path)
+            .creation_flags(crate::singbox::CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("Не удалось запустить установку обновления: {e}"))?;
+        info!("Обновление из ZIP: {} → {}, лог {}", root.display(), install_dir.display(), log.display());
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -930,6 +1069,8 @@ mod tests {
         #[cfg(target_os = "windows")]
         {
             assert_eq!(installer_file_name(&release(Some("UlTunnel-1.4.2-setup.exe"))).unwrap(), "UlTunnel-1.4.2-setup.exe");
+            assert_eq!(installer_file_name(&release(Some("ultunnel-desktop.zip"))).unwrap(), "ultunnel-desktop.zip");
+            assert_eq!(installer_file_name(&release(None)).unwrap(), "ultunnel-1.4.2.zip");
             assert!(installer_file_name(&release(Some("x.bat"))).is_err());
         }
         assert!(installer_file_name(&release(Some(".hidden"))).is_err());
